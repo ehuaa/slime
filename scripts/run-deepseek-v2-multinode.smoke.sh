@@ -136,7 +136,7 @@ MISC_ARGS=(
    --attention-dropout 0.0
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
-   --attention-backend flash
+   --attention-backend fused
    # Load the HF checkpoint directly through megatron.bridge (no torch_dist convert).
    --megatron-to-hf-mode bridge
 )
