@@ -162,12 +162,12 @@ MISC_ARGS=(
    --attention-dropout 0.0
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
-   # MLA has head_dim_qk=192 (128 nope + 64 rope) != head_dim_v=128. On A100 (sm80) the
-   # flash backend can't serve this: FlashAttn-2 requires head_dim_qk==head_dim_v, and
-   # FlashAttn-3 (which supports 192/128) needs sm90/Hopper. Forcing "flash" leaves NO
-   # backend -> TE raises "No dot product attention backend available". Use cuDNN "fused"
-   # (supports MLA qk!=v on sm80+). On Hopper you may switch back to flash/auto.
-   --attention-backend fused
+   # MLA head_dim_qk=192 (128 nope + 64 rope) != head_dim_v=128. Raw TE on A100 (sm80) can't
+   # serve qk!=v (FA2 needs qk==v; FA3 needs Hopper; cuDNN fused rejects 192/128 on sm80) ->
+   # would fall to unfused and OOM at long seq. slime's mla_v_pad_attention_patch pads V to
+   # 192 so qk==v==192 and flash works on A100. See slime/backends/megatron_utils/
+   # megatron_patch/mla_v_pad_attention_patch.py.
+   --attention-backend flash
    # Load the HF checkpoint directly through megatron.bridge (no torch_dist convert).
    --megatron-to-hf-mode bridge
 )
