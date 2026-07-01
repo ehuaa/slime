@@ -29,7 +29,7 @@ WANDB_KEY=${WANDB_KEY:?set WANDB_KEY env var (do not hardcode secrets)}
 # This cluster INJECTS MASTER_ADDR as a *hostname* (env VC_MASTER_HOSTS); Ray and the
 # sglang engines must register under a consistent IP. Force the master IP unconditionally
 # (overrides the injected hostname). EDIT THIS if the master node changes.
-MASTER_ADDR=10.200.102.106
+MASTER_ADDR=10.200.100.205
 
 # Worker ssh host: the non-master line in /etc/mpi/hostfile.
 WORKER_HOST=$(grep -v 'master' /etc/mpi/hostfile | awk 'NF{print $1; exit}')

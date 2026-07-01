@@ -23,7 +23,7 @@ SSH_PORT=8081
 # this as --node-ip-address, and the sglang engines register with the router under it.
 # This cluster INJECTS MASTER_ADDR as a *hostname* (env VC_MASTER_HOSTS); force the master
 # IP unconditionally (overrides the injected hostname). EDIT THIS if the master changes.
-MASTER_ADDR=10.200.102.106
+MASTER_ADDR=10.200.100.205
 
 # Worker ssh host: the non-master line in /etc/mpi/hostfile.
 WORKER_HOST=$(grep -v 'master' /etc/mpi/hostfile | awk 'NF{print $1; exit}')
