@@ -263,7 +263,16 @@ def wrap_model_provider_with_freeze(original_provider, args):
 
 
 def get_model_provider_func(args, role="actor"):
-    return wrap_model_provider_with_freeze(_get_model_provider_func(args, role), args)
+    provider = _get_model_provider_func(args, role)
+    # Ensure the MLA v-pad attention patch is active in THIS process (Ray train actor)
+    # before the model is built/run. The megatron_patch import side-effect applies it on
+    # the driver, but is not reliable inside the remote actor. Apply it AFTER
+    # _get_model_provider_func so it survives any TE (re)import the bridge does there.
+    # Idempotent; no-op for non-MLA models (head_dim_qk == head_dim_v).
+    from .megatron_patch.mla_v_pad_attention_patch import apply_mla_v_pad_patch
+
+    apply_mla_v_pad_patch()
+    return wrap_model_provider_with_freeze(provider, args)
 
 
 def freeze_model_params(model: GPTModel, args: argparse.Namespace):

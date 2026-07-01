@@ -17,19 +17,38 @@
 # dims are weighted sums of zeros (discarded), and softmax_scale uses head_dim_qk=192
 # which is unchanged. On Hopper you can drop this (flash/FA3 handle MLA natively).
 #
-# Applied by wrapping megatron.core.extensions.transformer_engine.TEDotProductAttention
-# .forward. The wrap is a no-op unless head_dim_qk != head_dim_v, so non-MLA (GQA) models
-# are unaffected.
+# Wraps megatron.core.extensions.transformer_engine.TEDotProductAttention.forward. The
+# wrap is a no-op unless head_dim_qk != head_dim_v, so non-MLA (GQA) models are
+# unaffected. apply_mla_v_pad_patch() is idempotent and is called both at import time
+# (driver) and explicitly from get_model_provider_func (guaranteed to run inside each
+# Ray train actor before the model's first forward, where the import side-effect alone
+# is not reliable).
 
 import logging
 import warnings
 
 logger = logging.getLogger(__name__)
 
-try:
-    import torch
-    import torch.nn.functional as F
-    from megatron.core.extensions.transformer_engine import TEDotProductAttention
+
+def apply_mla_v_pad_patch() -> bool:
+    """Idempotently wrap TEDotProductAttention.forward to pad MLA V up to the Q head-dim.
+
+    Returns True if the patch is in place (already or newly applied), False on failure.
+    """
+    try:
+        import torch.nn.functional as F
+        from megatron.core.extensions.transformer_engine import TEDotProductAttention
+    except ImportError as exc:
+        warnings.warn(
+            f"slime MLA v-pad attention patch not applied — Megatron/TE import failed ({exc!r}). "
+            "MLA models (head_dim_qk != head_dim_v) may fall back to the unfused attention "
+            "backend and OOM at long sequence lengths on non-Hopper GPUs.",
+            stacklevel=2,
+        )
+        return False
+
+    if getattr(TEDotProductAttention.forward, "_slime_mla_v_pad", False):
+        return True  # already applied
 
     _orig_te_dpa_forward = TEDotProductAttention.forward
 
@@ -59,18 +78,15 @@ try:
         out = out.reshape(*lead, -1, qd)[..., :vd].reshape(*lead, -1)
         return out
 
+    _mla_v_pad_forward._slime_mla_v_pad = True
     TEDotProductAttention.forward = _mla_v_pad_forward
-
-    logger.info(
-        "slime MLA v-pad attention patch applied to "
-        "megatron.core.extensions.transformer_engine.TEDotProductAttention.forward "
+    logger.warning(
+        "slime MLA v-pad attention patch applied to TEDotProductAttention.forward "
         "(pads head_dim_v up to head_dim_qk when they differ, enabling flash/cuDNN for MLA)."
     )
+    return True
 
-except ImportError as exc:
-    warnings.warn(
-        f"slime MLA v-pad attention patch not applied — Megatron/TE import failed ({exc!r}). "
-        "MLA models (head_dim_qk != head_dim_v) may fall back to the unfused attention "
-        "backend and OOM at long sequence lengths on non-Hopper GPUs.",
-        stacklevel=2,
-    )
+
+# Best-effort apply at import time (covers the driver and any import-based entry). The
+# authoritative application is the explicit call in get_model_provider_func.
+apply_mla_v_pad_patch()
