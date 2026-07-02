@@ -100,13 +100,19 @@ EVAL_ARGS=(
    --eval-top-p 1
 )
 
-# 16 GPUs: tp4 + ep8 (80 experts / ep8 = 10 experts/rank), pp1, cp1.
-#   non-expert dp = 16/(tp4*pp1*cp1) = 4 ; expert dp = 16/(etp1*ep8*pp1) = 2
+# 16 GPUs: tp4 x cp4 (non-expert dp=1), ep8 x etp1 (expert dp=2). cp4 splits the 32k
+# sequence across 4 ranks so each GPU's per-microbatch tokens (and activation) drop ~4x,
+# which — together with optimizer CPU offload below — lets rollout 32768 train on 80GB.
+#   non-expert: tp4 x cp4 x dp1 = 16 ; expert: etp1 x ep8 x edp2 = 16
+# NOTE: 32768 training is close to the 80GB limit; a single train step fit in smoke
+# (GBS 8), but at full --global-batch-size it can OOM by a small margin depending on how
+# many 32k samples land in a microbatch. If it OOMs, lower --rollout-max-response-len,
+# add --pipeline-model-parallel-size 2, or lower --sglang-mem-fraction-static.
 PERF_ARGS=(
    --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 1
+   --context-parallel-size 4
    --expert-model-parallel-size 8
    --expert-tensor-parallel-size 1
 
@@ -115,10 +121,9 @@ PERF_ARGS=(
    --recompute-num-layers 1
 
    --use-dynamic-batch-size
-   # Must be >= the longest single (prompt + response) sequence so it fits one microbatch:
-   # max prompt ~1468 + rollout response 32768 ~= 34236. Set 36864 with headroom.
-   # NOTE: this is a big memory bump (logits/activations); watch for OOM on 80GB/tp4.
-   --max-tokens-per-gpu 36864
+   # With cp4 the longest sequence (~34236) is split to ~8560 tokens/rank; 16384 packs a
+   # couple of those per microbatch. Raising this raises per-GPU activation -> OOM risk.
+   --max-tokens-per-gpu 16384
 )
 
 GRPO_ARGS=(
@@ -138,6 +143,14 @@ OPTIMIZER_ARGS=(
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
+
+   # Offload optimizer states (fp32 master + Adam m/v, ~23GB/GPU) to CPU. Required to fit
+   # 32768 training on 80GB; ~1 optimizer step per rollout so the CPU step is negligible
+   # vs generation, and --overlap-... hides the D2H/H2D transfers.
+   --optimizer-cpu-offload
+   --use-precision-aware-optimizer
+   --optimizer-offload-fraction 1.0
+   --overlap-cpu-optimizer-d2h-h2d
 )
 
 WANDB_ARGS=(

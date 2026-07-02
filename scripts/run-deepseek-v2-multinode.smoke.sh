@@ -67,13 +67,13 @@ ROLLOUT_ARGS=(
    --rm-type deepscaler
    --num-rollout 1
    # SMOKE: small batch for a fast single step (32 samples).
-   --rollout-batch-size 8
-   --n-samples-per-prompt 4
+   --rollout-batch-size 4
+   --n-samples-per-prompt 2
    --rollout-max-response-len 32768
    --rollout-max-context-len 65536
    --rollout-temperature 1
 
-   --global-batch-size 32
+   --global-batch-size 8
    --balance-data
 )
 
@@ -82,11 +82,14 @@ ROLLOUT_ARGS=(
 EVAL_ARGS=()
 
 # 16 GPUs: tp4 + ep8 (80 experts / ep8 = 10 experts/rank), pp1, cp1.
+# 16 GPUs: tp8 x cp2 (non-expert dp=1), ep8 x etp1 (expert dp=2). tp8 halves per-GPU
+# attention/logits activations (sequence-parallel), cp2 splits the 32k sequence across
+# 2 ranks -> another ~2x activation cut, letting rollout 32768 train on 80GB.
 PERF_ARGS=(
    --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 1
+   --context-parallel-size 4
    --expert-model-parallel-size 8
    --expert-tensor-parallel-size 1
 
@@ -96,7 +99,7 @@ PERF_ARGS=(
 
    --use-dynamic-batch-size
    # >= longest single (prompt + response): ~1468 + 32768 = 34236. 36864 with headroom.
-   --max-tokens-per-gpu 36864
+   --max-tokens-per-gpu 16384
 )
 
 GRPO_ARGS=(
@@ -116,6 +119,14 @@ OPTIMIZER_ARGS=(
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
+
+   # Offload optimizer states (fp32 master + Adam m/v, ~23GB/GPU) to CPU. Frees GPU for
+   # the long-sequence training activations. --use-precision-aware-optimizer is required
+   # by Megatron; --overlap-... hides the CPU step + D2H/H2D behind compute.
+   --optimizer-cpu-offload
+   --use-precision-aware-optimizer
+   --optimizer-offload-fraction 1.0
+   --overlap-cpu-optimizer-d2h-h2d
 )
 
 # SMOKE TEST: wandb disabled.

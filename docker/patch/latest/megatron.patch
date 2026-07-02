@@ -1005,3 +1005,87 @@ index e9736ac08..6567ed426 100644
                  )
                  for (model_chunk_idx, model_chunk) in enumerate(model)
              ]
+
+diff --git a/megatron/core/transformer/multi_latent_attention.py b/megatron/core/transformer/multi_latent_attention.py
+index cd3db50a3..205a085cf 100644
+--- a/megatron/core/transformer/multi_latent_attention.py
++++ b/megatron/core/transformer/multi_latent_attention.py
+@@ -65,6 +65,41 @@ except ImportError:
+     HAVE_TE = False
+ 
+ 
++def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_seq_params):
++    """Prepare value tensor for MLA core attention THD execution.
++
++    MLA has head_dim_qk (qk_nope + qk_rope) != head_dim_v. On Ampere (sm80) TE's
++    flash/cuDNN backends reject qk != v (FlashAttn-2 needs qk==v, FlashAttn-3 needs
++    sm90, cuDNN fused rejects 192/128 on sm80), leaving only the unfused backend which
++    OOMs at long sequence lengths. Zero-pad V up to the query head-dim so qk == v and
++    flash/cuDNN engages; the output is trimmed back afterwards. Exact: padded V dims are
++    weighted sums of zeros and softmax_scale uses head_dim_qk which is unchanged.
++    (slime patch mirroring the fix later merged upstream.)
++    """
++    orig_v_dim = value.shape[-1] if value is not None else None
++    padded_v_dim = orig_v_dim
++    need_v_pad = (
++        packed_seq_params is not None
++        and packed_seq_params.qkv_format == "thd"
++        and parallel_attention.config.experimental_attention_variant is None
++        and value is not None
++        and query.shape[-1] != orig_v_dim
++    )
++    if need_v_pad:
++        value = torch.nn.functional.pad(value, [0, query.shape[-1] - orig_v_dim])
++        padded_v_dim = value.shape[-1]
++    return value, need_v_pad, orig_v_dim, padded_v_dim
++
++
++def _trim_mla_core_attention_output(core_attn_out, need_v_pad, orig_v_dim, padded_v_dim):
++    """Trim THD MLA core attention output back to the original V dimension."""
++    if need_v_pad:
++        if core_attn_out.ndim == 2:
++            core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-1], -1, padded_v_dim)
++        core_attn_out = core_attn_out[..., :orig_v_dim]
++    return core_attn_out
++
++
+ @dataclass
+ class MLASelfAttentionSubmodules:
+     """Submodules for the MLA self-attention layer."""
+@@ -272,6 +307,21 @@ class MultiLatentAttention(Attention):
+         if value is not None:
+             value = value.contiguous()
+ 
++        # MLA v-pad: pad V up to the query head-dim (THD only) so flash/cuDNN can serve
++        # MLA on GPUs where the fused kernels reject head_dim_qk != head_dim_v. Trimmed
++        # back after the core attention. See _prepare_mla_core_attention_value above.
++        value, need_v_pad, orig_v_dim, padded_v_dim = _prepare_mla_core_attention_value(
++            self, query, value, packed_seq_params
++        )
++        _mla_orig_v_head_dim = None
++        if (
++            need_v_pad
++            and hasattr(self.core_attention, 'hidden_size_per_attention_head_v')
++            and self.core_attention.hidden_size_per_attention_head_v != value.shape[-1]
++        ):
++            _mla_orig_v_head_dim = self.core_attention.hidden_size_per_attention_head_v
++            self.core_attention.hidden_size_per_attention_head_v = value.shape[-1]
++
+         # ==================================
+         # core attention computation
+         # ==================================
+@@ -325,6 +375,14 @@ class MultiLatentAttention(Attention):
+                     core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
+                 )
+ 
++        # MLA v-pad: restore the V head-dim attribute and trim the padded output back to
++        # the original V dimension.
++        if _mla_orig_v_head_dim is not None:
++            self.core_attention.hidden_size_per_attention_head_v = _mla_orig_v_head_dim
++        core_attn_out = _trim_mla_core_attention_output(
++            core_attn_out, need_v_pad, orig_v_dim, padded_v_dim
++        )
++
+         # We are doing absorption with cache mla latents and decode mode.
+         if self.cache_mla_latents and inference_context.is_decode_only():
+             # core_attn_out = self.self.up_v_layer(core_attn_out)
