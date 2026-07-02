@@ -1,6 +1,7 @@
 # Adapt from https://github.com/NVIDIA/Megatron-LM/blob/b1efb3c7126ef7615e8c333432d76e08038e17ff/pretrain_gpt.py
 import argparse
 import inspect
+import os
 import re
 from contextlib import nullcontext
 from typing import Literal
@@ -263,6 +264,12 @@ def wrap_model_provider_with_freeze(original_provider, args):
 
 
 def get_model_provider_func(args, role="actor"):
+    # Opt-in debug: dump a CUDA memory snapshot on OOM (set SLIME_OOM_SNAPSHOT=1). Applied
+    # here because it must run inside the Ray train actor before the model's first forward.
+    if os.environ.get("SLIME_OOM_SNAPSHOT") == "1":
+        from .megatron_patch.oom_snapshot import enable_oom_snapshot
+
+        enable_oom_snapshot()
     return wrap_model_provider_with_freeze(_get_model_provider_func(args, role), args)
 
 

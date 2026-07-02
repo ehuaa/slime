@@ -194,7 +194,8 @@ RUNTIME_ENV_JSON="{
     \"no_proxy\": \"${no_proxy}\",
     \"MASTER_ADDR\": \"${MASTER_ADDR}\",
     \"TORCH_COMPILE_DISABLE\": \"1\",
-    \"TORCHDYNAMO_DISABLE\": \"1\"
+    \"TORCHDYNAMO_DISABLE\": \"1\",
+    \"SLIME_OOM_SNAPSHOT\": \"1\"
   }
 }"
 
