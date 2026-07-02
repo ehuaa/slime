@@ -31,6 +31,15 @@ echo "MASTER_ADDR=${MASTER_ADDR}  WORKER_HOST=${WORKER_HOST}  SSH_PORT=${SSH_POR
 
 SSH="ssh -p ${SSH_PORT} -o StrictHostKeyChecking=no -o BatchMode=yes"
 
+# ---------------- apply megatron.patch on both nodes ----------------
+# On a fresh machine the local Megatron-LM may not carry slime's patch (esp. the MLA
+# v-pad fix this model needs). Apply it here on master AND worker before training.
+# `patch --forward` is idempotent: it applies missing hunks and cleanly skips ones that
+# are already applied, so this is safe whether the image pre-applied the patch or not.
+APPLY_MEGATRON_PATCH="cd ${MEGATRON_PATH} && patch -p1 --forward < ${SLIME_DIR}/docker/patch/latest/megatron.patch >/dev/null 2>&1 ; grep -q _prepare_mla_core_attention_value megatron/core/transformer/multi_latent_attention.py && echo \"megatron.patch OK on \$(hostname)\" || echo \"WARN: megatron.patch NOT applied on \$(hostname)\""
+eval "${APPLY_MEGATRON_PATCH}"
+${SSH} "${WORKER_HOST}" "${APPLY_MEGATRON_PATCH}"
+
 # ---------------- cleanup (master + worker) ----------------
 CLEANUP_CMDS='pkill -9 sglang ; sleep 3 ; ray stop --force ; pkill -9 ray ; pkill -9 python ; sleep 3 ; pkill -9 ray ; pkill -9 python ; pkill -9 redis'
 ${SSH} "${WORKER_HOST}" "${CLEANUP_CMDS}" || true &
