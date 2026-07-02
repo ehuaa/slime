@@ -36,7 +36,7 @@ SSH="ssh -p ${SSH_PORT} -o StrictHostKeyChecking=no -o BatchMode=yes"
 # v-pad fix this model needs). Apply it here on master AND worker before training.
 # `patch --forward` is idempotent: it applies missing hunks and cleanly skips ones that
 # are already applied, so this is safe whether the image pre-applied the patch or not.
-APPLY_MEGATRON_PATCH="cd ${MEGATRON_PATH} && patch -p1 --forward < ${SLIME_DIR}/docker/patch/latest/megatron.patch >/dev/null 2>&1 ; grep -q _prepare_mla_core_attention_value megatron/core/transformer/multi_latent_attention.py && echo \"megatron.patch OK on \$(hostname)\" || echo \"WARN: megatron.patch NOT applied on \$(hostname)\""
+APPLY_MEGATRON_PATCH="if ! grep -q _prepare_mla_core_attention_value ${MEGATRON_PATH}/megatron/core/transformer/multi_latent_attention.py 2>/dev/null ; then ( cd ${MEGATRON_PATH} && patch -p1 --forward --batch -i ${SLIME_DIR}/docker/patch/latest/megatron.patch >/dev/null 2>&1 </dev/null ) ; fi ; grep -q _prepare_mla_core_attention_value ${MEGATRON_PATH}/megatron/core/transformer/multi_latent_attention.py && echo \"megatron.patch OK on \$(hostname)\" || echo \"WARN: megatron.patch NOT applied on \$(hostname)\""
 eval "${APPLY_MEGATRON_PATCH}"
 ${SSH} "${WORKER_HOST}" "${APPLY_MEGATRON_PATCH}"
 
@@ -76,13 +76,13 @@ ROLLOUT_ARGS=(
    --rm-type deepscaler
    --num-rollout 1
    # SMOKE: small batch for a fast single step (32 samples).
-   --rollout-batch-size 4
-   --n-samples-per-prompt 2
+   --rollout-batch-size 8
+   --n-samples-per-prompt 4
    --rollout-max-response-len 32768
    --rollout-max-context-len 65536
    --rollout-temperature 1
 
-   --global-batch-size 8
+   --global-batch-size 32
    --balance-data
 )
 

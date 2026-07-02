@@ -730,18 +730,28 @@ def train(
     for step_id in range(num_steps_per_rollout):
 
         # Run training step.
-        loss_dict, grad_norm = train_one_step(
-            args,
-            rollout_id,
-            step_id,
-            data_iterator,
-            model,
-            optimizer,
-            opt_param_scheduler,
-            num_microbatches[step_id],
-            global_batch_sizes[step_id],
-            microbatch_pbar=microbatch_pbar,
-        )
+        try:
+            loss_dict, grad_norm = train_one_step(
+                args,
+                rollout_id,
+                step_id,
+                data_iterator,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                num_microbatches[step_id],
+                global_batch_sizes[step_id],
+                microbatch_pbar=microbatch_pbar,
+            )
+        except torch.cuda.OutOfMemoryError:
+            # DEBUG (SLIME_OOM_SNAPSHOT=1): dump the CUDA memory history on OOM so the
+            # train-step OOM can be diagnosed. The OOM observer can miss torch_memory_saver
+            # allocations, so dump here deterministically, then re-raise.
+            if os.environ.get("SLIME_OOM_SNAPSHOT") == "1":
+                from .megatron_patch.oom_snapshot import dump_snapshot_now
+
+                dump_snapshot_now(tag="trainstep")
+            raise
 
         if step_id == 0:
             # Enable forward pre-hook after training step has successfully run. All subsequent

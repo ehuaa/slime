@@ -52,3 +52,23 @@ def enable_oom_snapshot(max_entries: int = 300000) -> None:
         logger.warning(f"[oom-snapshot] observer attached; will dump to {path} on OOM")
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"[oom-snapshot] attach observer failed: {exc!r}")
+
+
+def dump_snapshot_now(tag: str = "oom") -> None:
+    """Dump the recorded CUDA memory history right now (e.g. from an OOM except block).
+
+    The OOM observer can miss allocations made through a custom allocator (slime's colocate
+    torch_memory_saver), so this deterministic dump is the reliable path. Recording must
+    already be enabled via enable_oom_snapshot(); the dumped history still contains the
+    peak (alloc/free trace), even if some blocks were freed while the exception unwound.
+    """
+    try:
+        import torch
+
+        rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "x"))
+        host = socket.gethostname()
+        path = f"/root/slime/oom_snap_{host}_rank{rank}_{tag}.pickle"
+        torch.cuda.memory._dump_snapshot(path)
+        logger.warning(f"[oom-snapshot] dump_snapshot_now -> {path}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[oom-snapshot] dump_snapshot_now failed: {exc!r}")
