@@ -971,6 +971,7 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     from slime.utils.http_utils import run_router
 
     router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
+    router_args.policy = args.sglang_router_policy
     router_args.host = router_ip
     router_args.port = router_port
     router_args.prometheus_port = find_available_port(random.randint(4000, 5000))

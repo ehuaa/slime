@@ -24,7 +24,12 @@ def enable_oom_snapshot(max_entries: int = 300000) -> None:
     except ImportError:
         return
     try:
-        torch.cuda.memory._record_memory_history(max_entries=max_entries)
+        # stacks/context="all" is REQUIRED for per-block allocating stack traces to appear
+        # in the dumped snapshot. Without them the snapshot only carries segment/block sizes
+        # (device_traces stays empty), so you can size the blocks but not attribute them.
+        torch.cuda.memory._record_memory_history(
+            enabled="all", context="all", stacks="all", max_entries=max_entries
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"[oom-snapshot] _record_memory_history failed: {exc!r}")
         return

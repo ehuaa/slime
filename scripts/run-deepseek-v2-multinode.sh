@@ -79,7 +79,10 @@ CKPT_ARGS=(
    --ref-load "${HF_CKPT}"
    --load "${HF_CKPT}"
    --save /mnt/data/data/home/czh/RL/DeepSeek-V2-021_slime/
-   --save-interval 50
+   # Each checkpoint is ~413GB (bf16 weights + fp32 optimizer distcp). WARNING: no auto-cleanup
+   # -- checkpoints accumulate. The save FS has only ~1.7TB free (shared, 99% full), so ~4
+   # checkpoints fill it; delete old iter_* manually or raise --save-interval if it fills up.
+   --save-interval 20
 )
 
 ROLLOUT_ARGS=(
@@ -90,39 +93,48 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
    --rm-type deepscaler
    --num-rollout 100
-   --rollout-batch-size 32
+   --rollout-batch-size 64
    --n-samples-per-prompt 8
-   --rollout-max-response-len 32768
+   # 64000 fills the 65536 YaRN window: longest dapo prompt is 1468 tok, so 1468+64000=65468
+   # <= 65536 (no sample truncated by context). cp4 splits the longest single sequence to
+   # 65468/4 = 16367 tok/rank <= --max-tokens-per-gpu 16384, so peak activation is unchanged.
+   --rollout-max-response-len 64000
    --rollout-max-context-len 65536
    --rollout-temperature 1
 
-   --global-batch-size 256
+   --global-batch-size 512
    --balance-data
 )
 
 EVAL_ARGS=(
    --eval-interval 20
    --eval-prompt-data aime /mnt/zj-gpfs/home/czh/aime-2024.jsonl
-   --n-samples-per-eval-prompt 16
-   --eval-max-response-len 49152
+   --n-samples-per-eval-prompt 8
+   # longest aime prompt is 371 tok, so 371+64000=64371 <= 65536 context.
+   --eval-max-response-len 64000
    --eval-max-context-len 65536
    --eval-top-p 1
 )
 
-# 16 GPUs: tp4 x cp4 (non-expert dp=1), ep8 x etp1 (expert dp=2). cp4 splits the 32k
+# 16 GPUs: tp4 x cp4 (non-expert dp=1), ep16 x etp1 (expert dp=1). cp4 splits the long
 # sequence across 4 ranks so each GPU's per-microbatch tokens (and activation) drop ~4x,
-# which — together with optimizer CPU offload below — lets rollout 32768 train on 80GB.
-#   non-expert: tp4 x cp4 x dp1 = 16 ; expert: etp1 x ep8 x edp2 = 16
-# NOTE: 32768 training is close to the 80GB limit; a single train step fit in smoke
-# (GBS 8), but at full --global-batch-size it can OOM by a small margin depending on how
-# many 32k samples land in a microbatch. If it OOMs, lower --rollout-max-response-len,
-# add --pipeline-model-parallel-size 2, or lower --sglang-mem-fraction-static.
+# which — together with optimizer CPU offload below — lets rollout 64000 train on 80GB.
+#   non-expert: tp4 x cp4 x dp1 = 16 ; expert: etp1 x ep16 x edp1 = 16
+# ep16 (edp=1) is REQUIRED: with ep8/edp2 the expert param + fp32-grad buffers (~21GB) were
+# REPLICATED across the 2 nodes and full GBS OOM'd (an OOM snapshot showed PyTorch pinned at
+# ~62/80GB, static 37GB). ep16 removes the replication -> per-rank expert state ~10.5GB,
+# static drops to ~26.5GB, and the validated smoke ran a full GBS-32 step at ~51GB with
+# ~13GB headroom. Tradeoff: the MoE alltoall now spans both nodes (unavoidable without
+# per-node expert replication). Peak activation is bounded by --max-tokens-per-gpu, so it
+# does NOT grow with --global-batch-size or --rollout-max-response-len (only more/longer
+# microbatches, i.e. more time). If you ever OOM: lower --max-tokens-per-gpu, or add
+# --pipeline-model-parallel-size 2, or lower --sglang-mem-fraction-static.
 PERF_ARGS=(
    --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 4
-   --expert-model-parallel-size 8
+   --expert-model-parallel-size 16
    --expert-tensor-parallel-size 1
 
    --recompute-granularity full
@@ -130,8 +142,8 @@ PERF_ARGS=(
    --recompute-num-layers 1
 
    --use-dynamic-batch-size
-   # With cp4 the longest sequence (~34236) is split to ~8560 tokens/rank; 16384 packs a
-   # couple of those per microbatch. Raising this raises per-GPU activation -> OOM risk.
+   # With cp4 the longest sequence (1468+64000=65468) splits to ~16367 tokens/rank, which
+   # fills one microbatch at ~16384. Raising this raises per-GPU activation -> OOM risk.
    --max-tokens-per-gpu 16384
 )
 
@@ -154,7 +166,7 @@ OPTIMIZER_ARGS=(
    --adam-beta2 0.98
 
    # Offload optimizer states (fp32 master + Adam m/v, ~23GB/GPU) to CPU. Required to fit
-   # 32768 training on 80GB; ~1 optimizer step per rollout so the CPU step is negligible
+   # long-sequence training on 80GB; ~1 optimizer step per rollout so the CPU step is negligible
    # vs generation, and --overlap-... hides the D2H/H2D transfers.
    --optimizer-cpu-offload
    --use-precision-aware-optimizer
@@ -165,14 +177,14 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group deepseek-v2-021-multinode-tp4ep8-bridge
+   --wandb-group deepseek-v2-021-multinode-tp4ep16-bridge
    --wandb-key ${WANDB_KEY}
 )
 
 # One sglang engine per node (4 GPUs each), ep4 + dp-attention (best for MLA models).
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 4
-   --sglang-mem-fraction-static 0.7
+   --sglang-mem-fraction-static 0.85
    --sglang-ep-size 4
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
    --sglang-enable-dp-attention
@@ -186,9 +198,9 @@ MISC_ARGS=(
    --accumulate-allreduce-grads-in-fp32
    # MLA head_dim_qk=192 (128 nope + 64 rope) != head_dim_v=128. Raw TE on A100 (sm80) can't
    # serve qk!=v (FA2 needs qk==v; FA3 needs Hopper; cuDNN fused rejects 192/128 on sm80) ->
-   # would fall to unfused and OOM at long seq. slime's mla_v_pad_attention_patch pads V to
-   # 192 so qk==v==192 and flash works on A100. See slime/backends/megatron_utils/
-   # megatron_patch/mla_v_pad_attention_patch.py.
+   # would fall to unfused and OOM at long seq. The MLA v-pad hunk in docker/patch/latest/
+   # megatron.patch pads V to 192 so qk==v==192 and flash works on A100 (applied at the top
+   # of this script on both nodes). See multi_latent_attention.py _prepare_mla_core_attention_value.
    --attention-backend flash
    # Load the HF checkpoint directly through megatron.bridge (no torch_dist convert).
    --megatron-to-hf-mode bridge

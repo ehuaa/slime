@@ -1,41 +1,41 @@
 #!/bin/bash
-# SMOKE TEST for DeepSeek-V2 ("021-32b") multinode GRPO: 2 nodes x 8 GPUs = 16 GPUs, colocate.
-# Derived from run-deepseek-v2-multinode.sh with fast-path tweaks to validate the pipeline
-# end to end (bridge HF load, YaRN factor-2/65536 on both Megatron & sglang, generation,
-# weight sync, one train step) WITHOUT a full run:
-#   - wandb disabled (no WANDB_KEY needed)
-#   - num-rollout 1, small batch (rollout-batch-size 8 x n-samples 4 -> GBS 32) = one quick step
-#   - eval disabled (EVAL_ARGS empty -> train.py skips the pre-train eval)
-# Everything model/rope/length-related matches the real script so the smoke exercises the
-# real config (rollout 32768, YaRN 65536, max-tokens-per-gpu 36864).
+# MODEL-COMPARISON run for two DeepSeek-V2 "021" candidates: ONE complete step each
+# (pre-train eval on aime + full rollout of 512 samples + one GBS-512 train step), to compare
+# rollout/eval truncation ratios and pick the better base model for RL.
 #
-# PREREQ: the HF checkpoint dir must NOT contain `latest_checkpointed_iteration.txt`.
+# Usage:  bash scripts/run-deepseek-v2-cmp.sh A   # cot-geo-46w SFT  (checkpoint-1472)
+#         bash scripts/run-deepseek-v2-cmp.sh B   # 021-32B-A4B lcpt-1208
+#
+# Differences vs run-deepseek-v2-multinode.sh (besides the checkpoint):
+#   - num-rollout 1 (single step), wandb off (read metrics from the log)
+#   - --sglang-mem-fraction-static 0.85  (0.7 hit KV 0.94-0.96 peaks and 7 retracts at 512-way)
+#   - --sglang-router-policy random      (cache_aware pinned whole 8-sample groups per engine ->
+#     severe token imbalance; prompts are ~130 tok so prefix caching was worthless anyway)
+#   - --sglang-dp-size 2                 (attention tp2: faster per-request decode for the long
+#     tail; halves aggregate KV vs dp4, compensated by mem-fraction 0.85 + random routing)
 
 set -ex
+
+MODEL_TAG=${1:?usage: run-deepseek-v2-cmp.sh A|B}
+case "${MODEL_TAG}" in
+  A) HF_CKPT="/mnt/data/data/home/czh/RL/dsv2-021A-cotgeo-yarn2-65536" ;;
+  B) HF_CKPT="/mnt/data/data/home/czh/RL/dsv2-021B-a4b-yarn2-65536" ;;
+  *) echo "unknown model tag ${MODEL_TAG}"; exit 1 ;;
+esac
+echo "=== comparison run for model ${MODEL_TAG}: ${HF_CKPT} ==="
 
 # ---------------- cluster ----------------
 SLIME_DIR=/root/slime
 MEGATRON_PATH=/root/Megatron-LM
 SSH_PORT=8081
-# SMOKE TEST: wandb disabled, so no WANDB_KEY needed.
-
-# Master node IP (reachable from worker). MUST be an IP, not the hostname: Ray uses
-# this as --node-ip-address, and the sglang engines register with the router under it.
-# This cluster INJECTS MASTER_ADDR as a *hostname* (env VC_MASTER_HOSTS); force the master
-# IP unconditionally (overrides the injected hostname). EDIT THIS if the master changes.
 MASTER_ADDR=10.200.100.205
 
-# Worker ssh host: the non-master line in /etc/mpi/hostfile.
 WORKER_HOST=$(grep -v 'master' /etc/mpi/hostfile | awk 'NF{print $1; exit}')
 echo "MASTER_ADDR=${MASTER_ADDR}  WORKER_HOST=${WORKER_HOST}  SSH_PORT=${SSH_PORT}"
 
 SSH="ssh -p ${SSH_PORT} -o StrictHostKeyChecking=no -o BatchMode=yes"
 
 # ---------------- apply megatron.patch on both nodes ----------------
-# On a fresh machine the local Megatron-LM may not carry slime's patch (esp. the MLA
-# v-pad fix this model needs). Apply it here on master AND worker before training.
-# `patch --forward` is idempotent: it applies missing hunks and cleanly skips ones that
-# are already applied, so this is safe whether the image pre-applied the patch or not.
 APPLY_MEGATRON_PATCH="if ! grep -q _prepare_mla_core_attention_value ${MEGATRON_PATH}/megatron/core/transformer/multi_latent_attention.py 2>/dev/null ; then ( cd ${MEGATRON_PATH} && patch -p1 --forward --batch -i ${SLIME_DIR}/docker/patch/latest/megatron.patch >/dev/null 2>&1 </dev/null ) ; fi ; grep -q _prepare_mla_core_attention_value ${MEGATRON_PATH}/megatron/core/transformer/multi_latent_attention.py && echo \"megatron.patch OK on \$(hostname)\" || echo \"WARN: megatron.patch NOT applied on \$(hostname)\""
 eval "${APPLY_MEGATRON_PATCH}"
 ${SSH} "${WORKER_HOST}" "${APPLY_MEGATRON_PATCH}"
@@ -56,15 +56,12 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 # ---------------- model config ----------------
 source "${SLIME_DIR}/scripts/models/deepseek-v2.sh"
 
-# HF checkpoint (DeepseekV2ForCausalLM) — YaRN sibling dir (rope factor 2 / max_pos 65536).
-HF_CKPT="/mnt/data/data/home/czh/RL/dsv2-021-yarn2-65536"
-
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CKPT}"
    --ref-load "${HF_CKPT}"
    --load "${HF_CKPT}"
-   --save /mnt/data/data/home/czh/RL/DeepSeek-V2-021_slime/
-   --save-interval 50
+   --save "/mnt/data/data/home/czh/RL/DeepSeek-V2-021-cmp${MODEL_TAG}_slime/"
+   --save-interval 20
 )
 
 ROLLOUT_ARGS=(
@@ -74,27 +71,27 @@ ROLLOUT_ARGS=(
    --apply-chat-template
    --rollout-shuffle
    --rm-type deepscaler
+   # ONE complete step for the comparison.
    --num-rollout 1
-   # SMOKE: small batch for a fast single step (32 samples).
-   --rollout-batch-size 8
-   --n-samples-per-prompt 4
-   --rollout-max-response-len 32768
+   --rollout-batch-size 64
+   --n-samples-per-prompt 8
+   --rollout-max-response-len 64000
    --rollout-max-context-len 65536
    --rollout-temperature 1
 
-   --global-batch-size 32
+   --global-batch-size 512
    --balance-data
 )
 
-# SMOKE: no eval at all (eval_interval unset -> train.py skips the pre-train eval).
-# Eval correctness follows from rollout: same generation path; 49152+prompt < 65536 won't 400.
-EVAL_ARGS=()
+EVAL_ARGS=(
+   --eval-interval 20
+   --eval-prompt-data aime /mnt/zj-gpfs/home/czh/aime-2024.jsonl
+   --n-samples-per-eval-prompt 8
+   --eval-max-response-len 64000
+   --eval-max-context-len 65536
+   --eval-top-p 1
+)
 
-# 16 GPUs, non-expert world = tp4 x cp4 x pp1 = 16 (dp=1).
-# Expert world = etp1 x ep16 = 16 => edp=1 (NO expert replication). 80 experts / ep16 = 5/rank.
-# ep16 (was ep8/edp2) halves per-rank expert state: the OOM snapshot showed 21GB of expert
-# param+fp32-grad buffers replicated 2x under edp=2; edp=1 cuts that to ~10.5GB, freeing the
-# ~10GB that made GBS32 OOM (PyTorch was pinned at ~62/80 with sglang+NCCL eating the rest).
 PERF_ARGS=(
    --tensor-model-parallel-size 4
    --sequence-parallel
@@ -108,7 +105,6 @@ PERF_ARGS=(
    --recompute-num-layers 1
 
    --use-dynamic-batch-size
-   # >= longest single (prompt + response): ~1468 + 32768 = 34236. 36864 with headroom.
    --max-tokens-per-gpu 16384
 )
 
@@ -130,27 +126,24 @@ OPTIMIZER_ARGS=(
    --adam-beta1 0.9
    --adam-beta2 0.98
 
-   # Offload optimizer states (fp32 master + Adam m/v, ~23GB/GPU) to CPU. Frees GPU for
-   # the long-sequence training activations. --use-precision-aware-optimizer is required
-   # by Megatron; --overlap-... hides the CPU step + D2H/H2D behind compute.
    --optimizer-cpu-offload
    --use-precision-aware-optimizer
    --optimizer-offload-fraction 1.0
    --overlap-cpu-optimizer-d2h-h2d
 )
 
-# SMOKE TEST: wandb disabled.
+# comparison run: wandb off, metrics read from the log.
 WANDB_ARGS=()
 
-# One sglang engine per node (4 GPUs each), ep4 + dp-attention (best for MLA models).
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 4
    --sglang-mem-fraction-static 0.85
    --sglang-ep-size 4
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
    --sglang-enable-dp-attention
-   --sglang-dp-size 4
+   --sglang-dp-size 2
    --sglang-enable-dp-lm-head
+   --sglang-router-policy random
 )
 
 MISC_ARGS=(
@@ -158,7 +151,6 @@ MISC_ARGS=(
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
    --attention-backend flash
-   # Load the HF checkpoint directly through megatron.bridge (no torch_dist convert).
    --megatron-to-hf-mode bridge
 )
 
@@ -195,8 +187,7 @@ RUNTIME_ENV_JSON="{
     \"no_proxy\": \"${no_proxy}\",
     \"MASTER_ADDR\": \"${MASTER_ADDR}\",
     \"TORCH_COMPILE_DISABLE\": \"1\",
-    \"TORCHDYNAMO_DISABLE\": \"1\",
-    \"SLIME_OOM_SNAPSHOT\": \"1\"
+    \"TORCHDYNAMO_DISABLE\": \"1\"
   }
 }"
 

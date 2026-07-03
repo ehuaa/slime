@@ -27,6 +27,17 @@ def add_sglang_router_arguments(parser):
         default=14400,
         help="Timeout for requests to the SGLang router in seconds",
     )
+    parser.add_argument(
+        "--sglang-router-policy",
+        type=str,
+        default="cache_aware",
+        help=(
+            "Load-balancing policy of the SGLang router (e.g. cache_aware, round_robin, random, "
+            "power_of_two). cache_aware pins same-prefix requests (all n samples of one prompt) to "
+            "one worker; with short prompts and long correlated responses this clumps whole groups "
+            "onto one engine, so random/round_robin balances much better."
+        ),
+    )
     return parser
 
 
