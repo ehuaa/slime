@@ -19,6 +19,7 @@ MODEL_TAG=${1:?usage: run-deepseek-v2-cmp.sh A|B}
 case "${MODEL_TAG}" in
   A) HF_CKPT="/mnt/data/data/home/czh/RL/dsv2-021A-cotgeo-yarn2-65536" ;;
   B) HF_CKPT="/mnt/data/data/home/czh/RL/dsv2-021B-a4b-yarn2-65536" ;;
+  C) HF_CKPT="/mnt/data/data/home/czh/RL/dsv2-021C-cot0215-yarn2-65536" ;;
   *) echo "unknown model tag ${MODEL_TAG}"; exit 1 ;;
 esac
 echo "=== comparison run for model ${MODEL_TAG}: ${HF_CKPT} ==="

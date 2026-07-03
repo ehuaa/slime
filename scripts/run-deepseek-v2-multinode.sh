@@ -1,8 +1,15 @@
 #!/bin/bash
-# Multi-node GRPO training for DeepSeek-V2 ("021-32b" SFT checkpoint): 2 nodes x 8 GPUs = 16 GPUs, colocate.
-# Run this script ON THE MASTER node. It starts the Ray head here, sshes into the
-# worker (port 8081, host from /etc/mpi/hostfile) to join the Ray cluster, then
-# submits the training job.
+# Multi-node GRPO training for DeepSeek-V2 ("021-32b" SFT checkpoint): 8 nodes x 8 GPUs = 64 GPUs, colocate.
+#
+# SAME-SCRIPT MODE: launch this EXACT script on BOTH nodes simultaneously (the cluster
+# job launcher runs it on every pod). PREREQ: /root/slime and /root/Megatron-LM must be
+# identical on both nodes (copied ahead of time -- they are node-local disks), and the
+# MASTER_ADDR env var must be set on every node (the launcher injects it; hostname or IP
+# both work). Each node detects its role by comparing MASTER_ADDR against its own IPs:
+#   master: cleans up, applies megatron.patch locally, starts the Ray head, waits for
+#           all GPUs to join, submits the training job.
+#   worker: cleans up, applies megatron.patch locally, waits for the Ray head, joins,
+#           and stays alive until the head goes away (so the launcher pod doesn't exit).
 #
 # Model is a DeepseekV2ForCausalLM HF checkpoint loaded DIRECTLY via megatron.bridge
 # (--megatron-to-hf-mode bridge). No HF->torch_dist conversion is needed: --load /
@@ -15,45 +22,64 @@
 
 set -ex
 
-# ---------------- cluster ----------------
+# ---------------- cluster / role detection ----------------
 SLIME_DIR=/root/slime
 MEGATRON_PATH=/root/Megatron-LM
-SSH_PORT=8081
-# Provide your W&B API key via env: `export WANDB_KEY=...` before running.
-WANDB_KEY=${WANDB_KEY:?set WANDB_KEY env var (do not hardcode secrets)}
 
-# Master node IP (reachable from worker). MUST be an IP, not the hostname: Ray uses
-# this as --node-ip-address, and the sglang engines register with the router under it.
-# If the master advertises a hostname while the worker advertises an IP (its `hostname -i`),
-# the router ends up with mixed hostname+IP worker URLs and the worker pool breaks.
-# This cluster INJECTS MASTER_ADDR as a *hostname* (env VC_MASTER_HOSTS); Ray and the
-# sglang engines must register under a consistent IP. Force the master IP unconditionally
-# (overrides the injected hostname). EDIT THIS if the master node changes.
-MASTER_ADDR=10.200.100.205
+# The ONLY cluster input is the MASTER_ADDR env var (this cluster injects it as the
+# master HOSTNAME via VC_MASTER_HOSTS; setting it manually to a hostname or an IP also
+# works). No /etc/mpi/hostfile dependency.
+[ -n "${MASTER_ADDR:-}" ] || { echo "FATAL: MASTER_ADDR env var not set"; exit 1; }
+MASTER_HOST=${MASTER_ADDR%%,*}   # first entry if comma-separated
 
-# Worker ssh host: the non-master line in /etc/mpi/hostfile.
-WORKER_HOST=$(grep -v 'master' /etc/mpi/hostfile | awk 'NF{print $1; exit}')
-echo "MASTER_ADDR=${MASTER_ADDR}  WORKER_HOST=${WORKER_HOST}  SSH_PORT=${SSH_PORT}"
+# Resolve to an IP. Ray uses it as --node-ip-address and the sglang engines register
+# with the router under it; mixed hostname+IP worker URLs break the router pool, so a
+# bare hostname must be resolved before use.
+if echo "${MASTER_HOST}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+   MASTER_ADDR=${MASTER_HOST}
+else
+   MASTER_ADDR=$(getent hosts "${MASTER_HOST}" | awk '{print $1; exit}')
+fi
+[ -n "${MASTER_ADDR}" ] || { echo "FATAL: cannot resolve master IP from ${MASTER_HOST}"; exit 1; }
 
-SSH="ssh -p ${SSH_PORT} -o StrictHostKeyChecking=no -o BatchMode=yes"
-
-# ---------------- apply megatron.patch on both nodes ----------------
-# On a fresh machine the local Megatron-LM may not carry slime's patch (esp. the MLA
-# v-pad fix this model needs). Apply it here on master AND worker before training.
-# `patch --forward` is idempotent: it applies missing hunks and cleanly skips ones that
-# are already applied, so this is safe whether the image pre-applied the patch or not.
-APPLY_MEGATRON_PATCH="if ! grep -q _prepare_mla_core_attention_value ${MEGATRON_PATH}/megatron/core/transformer/multi_latent_attention.py 2>/dev/null ; then ( cd ${MEGATRON_PATH} && patch -p1 --forward --batch -i ${SLIME_DIR}/docker/patch/latest/megatron.patch >/dev/null 2>&1 </dev/null ) ; fi ; grep -q _prepare_mla_core_attention_value ${MEGATRON_PATH}/megatron/core/transformer/multi_latent_attention.py && echo \"megatron.patch OK on \$(hostname)\" || echo \"WARN: megatron.patch NOT applied on \$(hostname)\""
-eval "${APPLY_MEGATRON_PATCH}"
-${SSH} "${WORKER_HOST}" "${APPLY_MEGATRON_PATCH}"
-
-# ---------------- cleanup (master + worker) ----------------
-CLEANUP_CMDS='pkill -9 sglang ; sleep 3 ; ray stop --force ; pkill -9 ray ; pkill -9 python ; sleep 3 ; pkill -9 ray ; pkill -9 python ; pkill -9 redis'
-${SSH} "${WORKER_HOST}" "${CLEANUP_CMDS}" || true &
-eval "${CLEANUP_CMDS}" || true
-wait
+# Role: this node is the master iff one of its own IPs equals MASTER_ADDR.
+# NOTE: must be `hostname -I` (ALL addresses) -- these nodes have many NICs and
+# `hostname -i` returns only one of them (not necessarily the master-network one).
+if hostname -I | tr ' ' '\n' | grep -qx "${MASTER_ADDR}"; then ROLE=master; else ROLE=worker; fi
+echo "ROLE=${ROLE}  MASTER_ADDR=${MASTER_ADDR}"
 
 export PYTHONUNBUFFERED=1
-export no_proxy="127.0.0.1,localhost,${MASTER_ADDR},${WORKER_HOST}"
+export no_proxy="127.0.0.1,localhost,${MASTER_ADDR},${MASTER_HOST}"
+
+# ---------------- cleanup (each node cleans itself) ----------------
+CLEANUP_CMDS='pkill -9 sglang ; sleep 3 ; ray stop --force ; pkill -9 ray ; pkill -9 python ; sleep 3 ; pkill -9 ray ; pkill -9 python ; pkill -9 redis'
+eval "${CLEANUP_CMDS}" || true
+
+# ---------------- apply megatron.patch locally (both roles) ----------------
+# Idempotent grep-guard; /root/Megatron-LM is node-local so each node patches itself.
+if ! grep -q _prepare_mla_core_attention_value "${MEGATRON_PATH}/megatron/core/transformer/multi_latent_attention.py" 2>/dev/null; then
+   ( cd "${MEGATRON_PATH}" && patch -p1 --forward --batch -i "${SLIME_DIR}/docker/patch/latest/megatron.patch" >/dev/null 2>&1 </dev/null )
+fi
+grep -q _prepare_mla_core_attention_value "${MEGATRON_PATH}/megatron/core/transformer/multi_latent_attention.py" \
+   && echo "megatron.patch OK on $(hostname)" || { echo "FATAL: megatron.patch NOT applied on $(hostname)"; exit 1; }
+
+# ---------------- worker: join the Ray cluster and stay alive ----------------
+if [ "${ROLE}" = "worker" ]; then
+   until (exec 3<>"/dev/tcp/${MASTER_ADDR}/6379") 2>/dev/null; do echo "waiting for ray head..."; sleep 5; done
+   WIP=$(hostname -i | awk '{print $1}')
+   echo "joining ray from ${WIP}"
+   ray start --address="${MASTER_ADDR}:6379" --num-gpus 8 --node-ip-address "${WIP}" \
+      --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+   # Keep the pod alive while the head is up; exit when the job/head is gone.
+   sleep 30
+   while (exec 3<>"/dev/tcp/${MASTER_ADDR}/6379") 2>/dev/null; do sleep 30; done
+   echo "ray head gone, worker exiting"
+   exit 0
+fi
+
+# ---------------- master only from here on ----------------
+# Provide your W&B API key via env: `export WANDB_KEY=...` before running.
+WANDB_KEY=${WANDB_KEY:?set WANDB_KEY env var (do not hardcode secrets)}
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [ "$NVLINK_COUNT" -gt 0 ]; then HAS_NVLINK=1; else HAS_NVLINK=0; fi
@@ -63,13 +89,14 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 source "${SLIME_DIR}/scripts/models/deepseek-v2.sh"
 
 # HF checkpoint (DeepseekV2ForCausalLM). Loaded directly via the bridge.
+# Model A "cot-geo" (checkpoint-1472) WON the base-model comparison (2026-07-03):
+#   A: eval/aime 0.700, trunc 0.20, rollout median 14.6K  |  old cot-glm51: 0.454 / 0.41
+#   B (a4b-lcpt base): never emits EOS on chat prompts -> ~100% truncation, unusable for RL.
 # This is a YaRN sibling dir: symlinks to the original SFT weights + a config.json with
 # rope_scaling.factor=2.0 and max_position_embeddings=65536. Both the megatron.bridge
 # (Megatron MLA, via MLA_ROPE_SCALING_MAPPING) and sglang read rope from this config, so
 # train / rollout / eval all run consistently at YaRN factor-2 / 65536 context.
-# The model was SFT'd at 32k but needs YaRN factor-2 (65536) for good long-CoT math (AIME).
-# Original SFT weights (.../checkpoint-1521) are untouched.
-HF_CKPT="/mnt/data/data/home/czh/RL/dsv2-021-yarn2-65536"
+HF_CKPT="/mnt/data/data/home/czh/RL/dsv2-021A-cotgeo-yarn2-65536"
 
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CKPT}"
@@ -78,7 +105,7 @@ CKPT_ARGS=(
    # iter_XXXXXXX/), and keep --ref-load on the HF checkpoint.
    --ref-load "${HF_CKPT}"
    --load "${HF_CKPT}"
-   --save /mnt/data/data/home/czh/RL/DeepSeek-V2-021_slime/
+   --save /mnt/data/data/home/czh/RL/DeepSeek-V2-021A_slime/
    # Each checkpoint is ~413GB (bf16 weights + fp32 optimizer distcp). WARNING: no auto-cleanup
    # -- checkpoints accumulate. The save FS has only ~1.7TB free (shared, 99% full), so ~4
    # checkpoints fill it; delete old iter_* manually or raise --save-interval if it fills up.
@@ -93,23 +120,36 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
    --rm-type deepscaler
    --num-rollout 100
-   --rollout-batch-size 64
+   # DAPO-style dynamic sampling (validated 2026-07-03 on 16 GPUs): target 128 VALID groups
+   # per step (nonzero reward std; all-correct/all-wrong groups carry zero advantage = zero
+   # gradient and are dropped — unfiltered runs wasted 78% of samples). At 64 GPUs the os=512
+   # first wave is 4096 requests = 64/rank, the same per-rank load as the validated 16-GPU
+   # os=128 runs (KV peak ~0.6, zero retracts). Measured valid rate ~30% -> ~154 expected
+   # valid groups per wave >= 128, so one wave usually suffices. Aborted in-flight work is
+   # discarded (pure on-policy; NO --partial-rollout by choice).
+   --rollout-batch-size 128
    --n-samples-per-prompt 8
+   --over-sampling-batch-size 512
+   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
    # 64000 fills the 65536 YaRN window: longest dapo prompt is 1468 tok, so 1468+64000=65468
    # <= 65536 (no sample truncated by context). cp4 splits the longest single sequence to
    # 65468/4 = 16367 tok/rank <= --max-tokens-per-gpu 16384, so peak activation is unchanged.
+   # (Measured on model A: only ~8% of advantage samples exceed 32768; if rollout wall clock
+   # ever needs a ~30-40% cut, dropping this to 32768 costs only ~4-5% of positive signal.)
    --rollout-max-response-len 64000
    --rollout-max-context-len 65536
    --rollout-temperature 1
 
-   --global-batch-size 512
+   # 32 groups x 8 samples = 256 = GBS: exactly ONE on-policy update per rollout.
+   --num-steps-per-rollout 4
+   --global-batch-size 256
    --balance-data
 )
 
 EVAL_ARGS=(
    --eval-interval 20
    --eval-prompt-data aime /mnt/zj-gpfs/home/czh/aime-2024.jsonl
-   --n-samples-per-eval-prompt 8
+   --n-samples-per-eval-prompt 16
    # longest aime prompt is 371 tok, so 371+64000=64371 <= 65536 context.
    --eval-max-response-len 64000
    --eval-max-context-len 65536
@@ -177,11 +217,20 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group deepseek-v2-021-multinode-tp4ep16-bridge
+   --wandb-group deepseek-v2-021A-dapo-tp4cp4ep16
    --wandb-key ${WANDB_KEY}
 )
 
-# One sglang engine per node (4 GPUs each), ep4 + dp-attention (best for MLA models).
+# 4 GPUs/engine, ep4, dp-attention dp4 — the measured optimum on this A100 16-GPU cluster
+# (full-step A/B tests 2026-07-03, all vs this baseline's step_time 4464s):
+#   - dp2 (attention tp2): single-stream tail +24%, BUT halved KV pools -> 14 retracts +
+#     queueing at the 1024-concurrent wave and ~45% slower valid-group collection. LOST.
+#   - 8-GPU engine + ep8: single-stream +1.5% only (decode at bs=1 is kernel-latency-bound,
+#     not bandwidth-bound; fewer experts/GPU doesn't cut kernel count). No win.
+#   - --sglang-enable-torch-compile: no gain, CUDA graphs already cover launch overhead.
+# router policy random (not the sglang default cache_aware): prompts are ~130 tok so prefix
+# caching is worthless, while cache_aware pinned each prompt's 8 samples to one engine and
+# clumped long groups (KV 0.94-0.99 + retracts on one engine while others idled).
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 4
    --sglang-mem-fraction-static 0.85
@@ -190,6 +239,7 @@ SGLANG_ARGS=(
    --sglang-enable-dp-attention
    --sglang-dp-size 4
    --sglang-enable-dp-lm-head
+   --sglang-router-policy random
 )
 
 MISC_ARGS=(
@@ -206,28 +256,21 @@ MISC_ARGS=(
    --megatron-to-hf-mode bridge
 )
 
-# ---------------- start Ray cluster ----------------
+# ---------------- start Ray cluster (worker joins by itself, see the worker branch) ----------------
 ray start --head --node-ip-address "${MASTER_ADDR}" --port 6379 --num-gpus 8 \
    --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
-${SSH} "${WORKER_HOST}" "bash -lc '
-  export no_proxy=127.0.0.1,localhost,${MASTER_ADDR};
-  WIP=\$(hostname -i | awk \"{print \\\$1}\");
-  echo joining ray from \$WIP;
-  ray start --address=${MASTER_ADDR}:6379 --num-gpus 8 --node-ip-address \$WIP \
-     --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
-'"
-
+# Wait for the worker (running this same script) to join; allow up to ~10 min of skew.
 python3 - <<'PY'
 import ray, time
 ray.init(address="auto")
-for _ in range(60):
+for _ in range(300):
     g = ray.cluster_resources().get("GPU", 0)
     print("cluster GPUs:", g, flush=True)
-    if g >= 16:
+    if g >= 64:
         break
     time.sleep(2)
-assert ray.cluster_resources().get("GPU", 0) >= 16, "cluster did not reach 16 GPUs"
+assert ray.cluster_resources().get("GPU", 0) >= 64, "cluster did not reach 64 GPUs"
 PY
 
 # ---------------- submit training ----------------
@@ -246,7 +289,7 @@ RUNTIME_ENV_JSON="{
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
-   --actor-num-nodes 2 \
+   --actor-num-nodes 8 \
    --actor-num-gpus-per-node 8 \
    --colocate \
    ${MODEL_ARGS[@]} \
