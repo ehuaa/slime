@@ -23,13 +23,19 @@
 set -ex
 
 # ---------------- cluster / role detection ----------------
-SLIME_DIR=/root/slime
-MEGATRON_PATH=/root/Megatron-LM
+# SLIME_DIR from env (defaults to /root/slime if unset).
+SLIME_DIR=${SLIME_DIR:-/root/slime}
+MEGATRON_PATH=${MEGATRON_PATH:-/root/Megatron-LM}
 
 # The ONLY cluster input is the MASTER_ADDR env var (this cluster injects it as the
 # master HOSTNAME via VC_MASTER_HOSTS; setting it manually to a hostname or an IP also
 # works). No /etc/mpi/hostfile dependency.
 [ -n "${MASTER_ADDR:-}" ] || { echo "FATAL: MASTER_ADDR env var not set"; exit 1; }
+
+# Number of nodes from env (NNODES=4 for the 4-node cluster, 8 for 64 GPUs, ...).
+NNODES=${NNODES:-8}
+TOTAL_GPUS=$((NNODES * 8))
+echo "NNODES=${NNODES}  TOTAL_GPUS=${TOTAL_GPUS}"
 MASTER_HOST=${MASTER_ADDR%%,*}   # first entry if comma-separated
 
 # Resolve to an IP. Ray uses it as --node-ip-address and the sglang engines register
@@ -55,10 +61,35 @@ export no_proxy="127.0.0.1,localhost,${MASTER_ADDR},${MASTER_HOST}"
 CLEANUP_CMDS='pkill -9 sglang ; sleep 3 ; ray stop --force ; pkill -9 ray ; pkill -9 python ; sleep 3 ; pkill -9 ray ; pkill -9 python ; pkill -9 redis'
 eval "${CLEANUP_CMDS}" || true
 
+# ---------------- host free-memory guard (both roles) ----------------
+# Colocate offloads ~110GB to host per node within seconds at every step boundary. On
+# long-uptime nodes the page cache eats MemFree (available stays high but free drops to
+# tens of GB), and the kernel cannot reclaim fast enough for that allocation burst:
+# torch_memory_saver pause then fails with "cudaError 1 (invalid argument)" and kills all
+# ranks on the node (2026-07-07 03:58 crash: master free 44GB -> 8/8 ranks died; worker
+# free 450GB -> 8/8 fine). Drop caches now and keep MemFree > 250GB with a watchdog.
+sync && { echo 3 > /proc/sys/vm/drop_caches; } 2>/dev/null || true
+cat > /root/free_watchdog.sh <<'WDEOF'
+while true; do
+  f=$(awk '/MemFree/{print int($2/1048576)}' /proc/meminfo)
+  if [ "$f" -lt 250 ]; then
+    sync
+    echo 3 > /proc/sys/vm/drop_caches
+    echo "$(date +%F_%T) dropped caches (free was ${f}GB)"
+  fi
+  sleep 120
+done
+WDEOF
+pkill -f 'bash /root/free_watchdog.sh' 2>/dev/null || true
+setsid nohup bash /root/free_watchdog.sh >> /root/free_watchdog.log 2>&1 < /dev/null &
+
 # ---------------- apply megatron.patch locally (both roles) ----------------
 # Idempotent grep-guard; /root/Megatron-LM is node-local so each node patches itself.
 if ! grep -q _prepare_mla_core_attention_value "${MEGATRON_PATH}/megatron/core/transformer/multi_latent_attention.py" 2>/dev/null; then
-   ( cd "${MEGATRON_PATH}" && patch -p1 --forward --batch -i "${SLIME_DIR}/docker/patch/latest/megatron.patch" >/dev/null 2>&1 </dev/null )
+   # NOTE: patch --forward exits 1 when some hunks are already applied (fresh images ship
+   # Megatron with part of the patch baked in) -- that is fine, the grep below is the real
+   # gate, so don't let set -e kill the script here.
+   ( cd "${MEGATRON_PATH}" && patch -p1 --forward --batch -i "${SLIME_DIR}/docker/patch/latest/megatron.patch" >/dev/null 2>&1 </dev/null ) || true
 fi
 grep -q _prepare_mla_core_attention_value "${MEGATRON_PATH}/megatron/core/transformer/multi_latent_attention.py" \
    && echo "megatron.patch OK on $(hostname)" || { echo "FATAL: megatron.patch NOT applied on $(hostname)"; exit 1; }
@@ -105,7 +136,7 @@ CKPT_ARGS=(
    # iter_XXXXXXX/), and keep --ref-load on the HF checkpoint.
    --ref-load "${HF_CKPT}"
    --load "${HF_CKPT}"
-   --save /mnt/data/data/home/czh/RL/DeepSeek-V2-021A_slime/
+   --save /mnt/data/data/home/czh/RL/DeepSeek-V2-021A_slime_dapo_overlong/
    # Each checkpoint is ~413GB (bf16 weights + fp32 optimizer distcp). WARNING: no auto-cleanup
    # -- checkpoints accumulate. The save FS has only ~1.7TB free (shared, 99% full), so ~4
    # checkpoints fill it; delete old iter_* manually or raise --save-interval if it fills up.
@@ -119,6 +150,16 @@ ROLLOUT_ARGS=(
    --apply-chat-template
    --rollout-shuffle
    --rm-type deepscaler
+   # DAPO Soft Overlong Punishment (added 2026-07-04 after a 27-step run showed runaway
+   # length: truncated samples score 0, so fully-truncated groups are zero-std and were
+   # DROPPED by the nonzero-std filter -- the longest generations never received negative
+   # feedback while long-correct ones were reinforced at full weight; response_len and
+   # truncation climbed monotonically and eval fell below step-0). custom_rm = deepscaler
+   # + linear length penalty over the last 16384 tokens before the cap (0 -> -1;
+   # truncated = -1). Long-but-finished samples now differ in reward inside a group =>
+   # such groups PASS the std filter and deliver the length-pressure gradient. Eval
+   # rewards are NOT shaped (is_eval metadata guard). Buffer: env DAPO_OVERLONG_BUFFER.
+   --custom-rm-path slime.rollout.rm_hub.dapo_overlong.custom_rm
    --num-rollout 100
    # DAPO-style dynamic sampling (validated 2026-07-03 on 16 GPUs): target 128 VALID groups
    # per step (nonzero reward std; all-correct/all-wrong groups carry zero advantage = zero
@@ -127,9 +168,9 @@ ROLLOUT_ARGS=(
    # os=128 runs (KV peak ~0.6, zero retracts). Measured valid rate ~30% -> ~154 expected
    # valid groups per wave >= 128, so one wave usually suffices. Aborted in-flight work is
    # discarded (pure on-policy; NO --partial-rollout by choice).
-   --rollout-batch-size 128
+   --rollout-batch-size 32
    --n-samples-per-prompt 8
-   --over-sampling-batch-size 512
+   --over-sampling-batch-size 128
    --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
    # 64000 fills the 65536 YaRN window: longest dapo prompt is 1468 tok, so 1468+64000=65468
    # <= 65536 (no sample truncated by context). cp4 splits the longest single sequence to
@@ -141,19 +182,16 @@ ROLLOUT_ARGS=(
    --rollout-temperature 1
 
    # 32 groups x 8 samples = 256 = GBS: exactly ONE on-policy update per rollout.
-   --num-steps-per-rollout 4
    --global-batch-size 256
    --balance-data
 )
 
 EVAL_ARGS=(
    --eval-interval 20
-   --eval-prompt-data aime /mnt/zj-gpfs/home/czh/aime-2024.jsonl
-   --n-samples-per-eval-prompt 16
-   # longest aime prompt is 371 tok, so 371+64000=64371 <= 65536 context.
-   --eval-max-response-len 64000
+   # Dataset config moved to YAML: it also tags eval samples with metadata is_eval=true so
+   # the dapo_overlong custom RM skips reward shaping during eval (scores = pure accuracy).
+   --eval-config "${SLIME_DIR}/scripts/eval-config-deepseek-v2.yaml"
    --eval-max-context-len 65536
-   --eval-top-p 1
 )
 
 # 16 GPUs: tp4 x cp4 (non-expert dp=1), ep16 x etp1 (expert dp=1). cp4 splits the long
@@ -195,6 +233,12 @@ GRPO_ARGS=(
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
+   # DAPO Token-Level PG Loss: default sample-level normalization averages the loss inside
+   # each sample first, so a 64K-token negative sample contributes ~1/64000 gradient per
+   # token while short positives hit at full weight -- long generations were rewarded at
+   # full strength but punished at a discount, feeding the length runaway above. Per-token
+   # normalization makes every token weigh the same regardless of sample length.
+   --calculate-per-token-loss
 )
 
 OPTIMIZER_ARGS=(
@@ -212,6 +256,13 @@ OPTIMIZER_ARGS=(
    --use-precision-aware-optimizer
    --optimizer-offload-fraction 1.0
    --overlap-cpu-optimizer-d2h-h2d
+    # The CPU optimizer buffers are pinned by default (~23GB/GPU x8 ranks = ~184GB/node of
+   # pinned host memory). On 1TB-RAM nodes this starves torch_memory_saver.pause(), whose
+   # cudaMallocHost then returns nullptr -> "cudaError error: 1 (invalid argument)" and the
+   # train actor dies (THUDM/slime#1786). Unpinned makes the once-per-rollout optimizer
+   # D2H/H2D copies slower, which is negligible here.
+   --no-pin-cpu-grads
+   --no-pin-cpu-params
 )
 
 WANDB_ARGS=(
@@ -260,17 +311,22 @@ MISC_ARGS=(
 ray start --head --node-ip-address "${MASTER_ADDR}" --port 6379 --num-gpus 8 \
    --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
-# Wait for the worker (running this same script) to join; allow up to ~10 min of skew.
+# Wait for the workers (running this same script) to join. Cold starts copy the code
+# tree from shared storage first (minutes when several nodes copy in parallel), so
+# allow up to ~30 min of skew.
+export TOTAL_GPUS
 python3 - <<'PY'
 import ray, time
 ray.init(address="auto")
-for _ in range(300):
+import os
+target = int(os.environ["TOTAL_GPUS"])
+for _ in range(900):
     g = ray.cluster_resources().get("GPU", 0)
     print("cluster GPUs:", g, flush=True)
-    if g >= 64:
+    if g >= target:
         break
     time.sleep(2)
-assert ray.cluster_resources().get("GPU", 0) >= 64, "cluster did not reach 64 GPUs"
+assert ray.cluster_resources().get("GPU", 0) >= target, f"cluster did not reach {target} GPUs"
 PY
 
 # ---------------- submit training ----------------
@@ -286,10 +342,13 @@ RUNTIME_ENV_JSON="{
   }
 }"
 
+# train.py is resolved relative to the job cwd; run from SLIME_DIR so the script works
+# no matter where it was launched from.
+cd "${SLIME_DIR}"
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
-   --actor-num-nodes 8 \
+   --actor-num-nodes ${NNODES} \
    --actor-num-gpus-per-node 8 \
    --colocate \
    ${MODEL_ARGS[@]} \

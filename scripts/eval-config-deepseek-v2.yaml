@@ -1,0 +1,20 @@
+# Eval dataset config for run-deepseek-v2-multinode.sh (replaces the legacy
+# --eval-prompt-data / --n-samples-per-eval-prompt / --eval-max-response-len CLI flags).
+#
+# metadata_overrides.is_eval tags every eval sample so the custom reward function
+# (slime.rollout.rm_hub.dapo_overlong.custom_rm) skips the training-only soft overlong
+# punishment and eval scores stay pure accuracy. No slime core change needed: the eval
+# path merges metadata_overrides into sample.metadata (slime/utils/eval_config.py).
+#
+# temperature is not set here -> falls back to rollout_temperature (1), same as before.
+# eval context len stays a CLI arg (--eval-max-context-len 65536).
+eval:
+  datasets:
+    - name: aime
+      path: /mnt/zj-gpfs/home/czh/aime-2024.jsonl
+      n_samples_per_eval_prompt: 16
+      # longest aime prompt is 371 tok, so 371+64000=64371 <= 65536 context.
+      max_response_len: 64000
+      top_p: 1
+      metadata_overrides:
+        is_eval: true
