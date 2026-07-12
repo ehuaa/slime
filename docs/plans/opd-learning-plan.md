@@ -109,7 +109,13 @@ D9 的策略梯度 → D11 的 KL 蒸馏 → D13 的计划映射。其余都可�
 - 自测:vocab-parallel 下取"全局词 id=v 的概率"分几步?(判断 v 在哪个分片 → 本地 gather
   → allreduce)——这就是 M1 cross 项。
 
-### D8:CP / SP / PP / EP 一日通(CP 精读,其余够用即可)
+### D8:CP / SP / PP / EP 一日通(v2 注:CP 从 M2 风险点降级为背景知识)
+
+> **2026-07-13 v2 修订**:开发计划 M2 已改用 RoutingReplay 同款的"微批 record/pop"传递
+> teacher top-K(见 `opd-full-vocab-kl-plan.md` 决策 A v2),不再做 per-sample CP 切片,
+> 所以本日的 CP 精读从"M2 直接依赖"降级为"读懂训练日志所需的背景"。省出的精力移到
+> **精读 `slime/utils/routing_replay.py` + `actor.py fill_routing_replay`(:295)**——
+> 这个 record/pop 模式就是 M2 的实现模板,而且它已经在 R3 生产中验证过。
 
 - 读:Playbook 对应各章 + Megatron CP 文档
   https://docs.nvidia.com/megatron-core/developer-guide/latest/api-guide/context_parallel.html
@@ -184,8 +190,10 @@ D9 的策略梯度 → D11 的 KL 蒸馏 → D13 的计划映射。其余都可�
   `_extract_per_sample`:296(用 D8 的 CP 知识)→ `policy_loss_function` → `loss_function`:1140。
 - 动手:追踪 `teacher_log_probs` 完整生命周期:产生(actor.py:469)→ offload(:259)→
   get_batch(model.py:503)→ 消费(loss.py:557)。**这条链就是档2 M2 要复制的模板。**
-- 收口:重读 `opd-full-vocab-kl-plan.md`,逐条映射:M1 三次 allreduce←D7;M2 2-D 切片
-  风险←D8;top-K 压缩←D3+D6 显存账;自蒸馏判据←D11 KL(p‖p)=0。给计划提 ≥2 个问题。
+- 收口:重读 `opd-full-vocab-kl-plan.md`(v2),逐条映射:M1a 的 vocab-parallel gather←D7
+  (v2 后 M1 只剩这一步跨 rank 通信,三次 allreduce 的熵链路移入可选 M1b);M2 record/pop
+  ←D8 v2 注的 routing_replay 精读;top-K 压缩←D3+D6 显存账;自蒸馏判据←D11 KL(p‖p)=0。
+  给计划提 ≥2 个问题。
 
 ### D14:编码热身(M1 的原型)
 
