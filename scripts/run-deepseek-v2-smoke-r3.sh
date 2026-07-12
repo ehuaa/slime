@@ -1,4 +1,7 @@
 #!/bin/bash
+# SMOKE TEST variant of run-deepseek-v2-multinode.sh: 2 nodes / 16 GPUs, 2 rollouts
+# (rollout 0 -> 2 train steps -> rollout 1 -> 2 train steps), small batch, short cap,
+# no eval / no wandb / no checkpoint saves. Validates KL 1e-3 + R3 + 2-step pipeline.
 # Multi-node GRPO training for DeepSeek-V2 ("021-32b" SFT checkpoint): 8 nodes x 8 GPUs = 64 GPUs, colocate.
 #
 # SAME-SCRIPT MODE: launch this EXACT script on BOTH nodes simultaneously (the cluster
@@ -21,6 +24,7 @@
 # Env already has slime + Megatron-LM + megatron.bridge; no pip install needed.
 
 set -ex
+export DAPO_OVERLONG_BUFFER=4000
 
 # ---------------- cluster / role detection ----------------
 # SLIME_DIR from env (defaults to /root/slime if unset).
@@ -38,7 +42,7 @@ cd "${SLIME_DIR}"
 [ -n "${MASTER_ADDR:-}" ] || { echo "FATAL: MASTER_ADDR env var not set"; exit 1; }
 
 # Number of nodes from env (NNODES=4 for the 4-node cluster, 8 for 64 GPUs, ...).
-NNODES=${NNODES:-8}
+NNODES=${NNODES:-2}
 TOTAL_GPUS=$((NNODES * 8))
 echo "NNODES=${NNODES}  TOTAL_GPUS=${TOTAL_GPUS}"
 MASTER_HOST=${MASTER_ADDR%%,*}   # first entry if comma-separated
@@ -115,7 +119,7 @@ fi
 
 # ---------------- master only from here on ----------------
 # Provide your W&B API key via env: `export WANDB_KEY=...` before running.
-WANDB_KEY=${WANDB_KEY:?set WANDB_KEY env var (do not hardcode secrets)}
+# smoke: no wandb
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [ "$NVLINK_COUNT" -gt 0 ]; then HAS_NVLINK=1; else HAS_NVLINK=0; fi
@@ -141,11 +145,11 @@ CKPT_ARGS=(
    # iter_XXXXXXX/), and keep --ref-load on the HF checkpoint.
    --ref-load "${HF_CKPT}"
    --load "${HF_CKPT}"
-   --save /mnt/data/data/home/czh/RL/DeepSeek-V2-021A_slime_dapo_overlong/
+   --save /mnt/data/data/home/czh/RL/DeepSeek-V2-021A_smoke_r3/
    # Each checkpoint is ~413GB (bf16 weights + fp32 optimizer distcp). WARNING: no auto-cleanup
    # -- checkpoints accumulate. The save FS has only ~1.7TB free (shared, 99% full), so ~4
    # checkpoints fill it; delete old iter_* manually or raise --save-interval if it fills up.
-   --save-interval 20
+   --save-interval 100000
 )
 
 ROLLOUT_ARGS=(
@@ -165,7 +169,7 @@ ROLLOUT_ARGS=(
    # such groups PASS the std filter and deliver the length-pressure gradient. Eval
    # rewards are NOT shaped (is_eval metadata guard). Buffer: env DAPO_OVERLONG_BUFFER.
    --custom-rm-path slime.rollout.rm_hub.dapo_overlong.custom_rm
-   --num-rollout 100
+   --num-rollout 2
    # DAPO-style dynamic sampling (validated 2026-07-03 on 16 GPUs): target 128 VALID groups
    # per step (nonzero reward std; all-correct/all-wrong groups carry zero advantage = zero
    # gradient and are dropped — unfiltered runs wasted 78% of samples). At 64 GPUs the os=512
@@ -173,16 +177,16 @@ ROLLOUT_ARGS=(
    # os=128 runs (KV peak ~0.6, zero retracts). Measured valid rate ~30% -> ~154 expected
    # valid groups per wave >= 128, so one wave usually suffices. Aborted in-flight work is
    # discarded (pure on-policy; NO --partial-rollout by choice).
-   --rollout-batch-size 64
+   --rollout-batch-size 8
    --n-samples-per-prompt 8
-   --over-sampling-batch-size 256
+   --over-sampling-batch-size 16
    --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
    # 64000 fills the 65536 YaRN window: longest dapo prompt is 1468 tok, so 1468+64000=65468
    # <= 65536 (no sample truncated by context). cp4 splits the longest single sequence to
    # 65468/4 = 16367 tok/rank <= --max-tokens-per-gpu 16384, so peak activation is unchanged.
    # (Measured on model A: only ~8% of advantage samples exceed 32768; if rollout wall clock
    # ever needs a ~30-40% cut, dropping this to 32768 costs only ~4-5% of positive signal.)
-   --rollout-max-response-len 64000
+   --rollout-max-response-len 16384
    --rollout-max-context-len 65536
    --rollout-temperature 1
 
@@ -191,13 +195,7 @@ ROLLOUT_ARGS=(
    --balance-data
 )
 
-EVAL_ARGS=(
-   --eval-interval 20
-   # Dataset config moved to YAML: it also tags eval samples with metadata is_eval=true so
-   # the dapo_overlong custom RM skips reward shaping during eval (scores = pure accuracy).
-   --eval-config "${SLIME_DIR}/scripts/eval-config-deepseek-v2.yaml"
-   --eval-max-context-len 65536
-)
+EVAL_ARGS=()
 
 # 16 GPUs: tp4 x cp4 (non-expert dp=1), ep16 x etp1 (expert dp=1). cp4 splits the long
 # sequence across 4 ranks so each GPU's per-microbatch tokens (and activation) drop ~4x,
@@ -288,12 +286,7 @@ OPTIMIZER_ARGS=(
    --no-pin-cpu-params
 )
 
-WANDB_ARGS=(
-   --use-wandb
-   --wandb-project slime-dev
-   --wandb-group deepseek-v2-021A-dapo-tp4cp4ep16
-   --wandb-key ${WANDB_KEY}
-)
+WANDB_ARGS=()
 
 # 4 GPUs/engine, ep4, dp-attention dp4 — the measured optimum on this A100 16-GPU cluster
 # (full-step A/B tests 2026-07-03, all vs this baseline's step_time 4464s):
