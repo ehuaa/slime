@@ -1,0 +1,14 @@
+# Smoke-test eval config (used by run-deepseek-v2-opd-smoke.sh): 1 sample per aime
+# prompt at a 16384 cap so the step-0 eval finishes in ~10-15 min instead of hours.
+# Validates the rm_type-per-dataset override end to end (run default --rm-type zero,
+# aime scored by deepscaler). NOT for real accuracy numbers (n=1 is high-variance).
+eval:
+  datasets:
+    - name: aime
+      rm_type: deepscaler
+      path: /mnt/zj-gpfs/home/czh/aime-2024.jsonl
+      n_samples_per_eval_prompt: 1
+      max_response_len: 16384
+      top_p: 1
+      metadata_overrides:
+        is_eval: true

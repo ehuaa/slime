@@ -83,6 +83,11 @@ async def async_rm(args, sample: Sample, **kwargs):
         from .ifbench import compute_ifbench_reward
 
         return compute_ifbench_reward(response, label, metadata=metadata)
+    elif rm_type == "zero":
+        # Pure on-policy distillation: task reward is identically 0, the whole
+        # learning signal is the OPD KL injected into advantages. Keeps the
+        # normal rm dispatch alive so eval datasets can override rm_type.
+        return 0.0
     elif rm_type == "random":
         return random.randint(0, 1)
     elif rm_type:
