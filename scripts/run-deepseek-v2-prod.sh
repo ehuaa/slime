@@ -1,5 +1,9 @@
 #!/bin/bash
-# PURE on-policy distillation (OPD, Tinker-style reverse-KL only) for DeepSeek-V2 021A.
+# PRODUCTION pure on-policy distillation (OPD, Tinker-style reverse-KL only) for DeepSeek-V2 021A.
+# Clean copy of run-deepseek-v2-opd.sh with the 2026-07-13 hang-forensics instrumentation
+# removed (eval re-enabled, no flight recorder, no rollout debug dumps) after the full
+# rollout 0 cycle (generation -> 3 forwards -> 4 train steps -> weight resync) was
+# verified stable on cluster ji-jupyter-159249514937478016.
 # 4 nodes x 8 GPUs = 32 GPUs, colocate -- same layout/launch as run-deepseek-v2-multinode.sh
 # (launch this EXACT script on all 4 nodes with MASTER_ADDR set; NNODES defaults to 4).
 #
@@ -136,11 +140,6 @@ while true; do
     echo "\$(date +%F_%T) pruning \${d}"
     rm -rf "\${d}"
   done
-  # debug rollout dumps rotate the same way: newest 2 are enough to replay a hang.
-  ls /mnt/zj-gpfs/output/czh/opd_debug/rollout_*.pt 2>/dev/null | sort -t_ -k2 -n | head -n -2 | while read -r f; do
-    echo "\$(date +%F_%T) pruning \${f}"
-    rm -f "\${f}"
-  done
   sleep 300
 done
 PREOF
@@ -179,7 +178,7 @@ CKPT_ARGS=(
    # Each checkpoint is ~413GB (bf16 weights + fp32 optimizer distcp). WARNING: no auto-cleanup
    # -- checkpoints accumulate. The save FS has only ~1.7TB free (shared, 99% full), so ~4
    # checkpoints fill it; delete old iter_* manually or raise --save-interval if it fills up.
-   --save-interval 6
+   --save-interval 20
 )
 
 ROLLOUT_ARGS=(
@@ -210,23 +209,15 @@ ROLLOUT_ARGS=(
    --rollout-temperature 1
    --num-steps-per-rollout 4
    --balance-data
-   # HANG FORENSICS: persist every rollout so a wedged train phase can be replayed
-   # offline with --load-debug-rollout-data + --debug-train-only (docs/en/developer_guide/debug.md).
-   --save-debug-rollout-data /mnt/zj-gpfs/output/czh/opd_debug/rollout_{rollout_id}.pt
 )
 
-# HANG FORENSICS (2026-07-13): previous OPD run died in a 600s NCCL REDUCE_SCATTER_BASE
-# timeout in the FIRST train microbatch after rollout 0 (embedding reduce-scatter).
-# eval disabled temporarily so the rerun goes straight to rollout 0 -> train and we get a
-# clean reproduction with the flight recorder armed. RESTORE the block below afterwards.
-EVAL_ARGS=()
-# EVAL_ARGS=(
-#    --eval-interval 6
-#    # Dataset config moved to YAML: it also tags eval samples with metadata is_eval=true so
-#    # the dapo_overlong custom RM skips reward shaping during eval (scores = pure accuracy).
-#    --eval-config "${SLIME_DIR}/scripts/eval-config-deepseek-v2.yaml"
-#    --eval-max-context-len 65536
-# )
+EVAL_ARGS=(
+   --eval-interval 20
+   # Dataset config moved to YAML: it also tags eval samples with metadata is_eval=true so
+   # the dapo_overlong custom RM skips reward shaping during eval (scores = pure accuracy).
+   --eval-config "${SLIME_DIR}/scripts/eval-config-deepseek-v2.yaml"
+   --eval-max-context-len 65536
+)
 
 # 16 GPUs: tp4 x cp4 (non-expert dp=1), ep16 x etp1 (expert dp=1). cp4 splits the long
 # sequence across 4 ranks so each GPU's per-microbatch tokens (and activation) drop ~4x,
@@ -379,16 +370,9 @@ RUNTIME_ENV_JSON="{
     \"no_proxy\": \"${no_proxy}\",
     \"MASTER_ADDR\": \"${MASTER_ADDR}\",
     \"TORCH_COMPILE_DISABLE\": \"1\",
-    \"TORCHDYNAMO_DISABLE\": \"1\",
-    \"TORCH_NCCL_TRACE_BUFFER_SIZE\": \"2000\",
-    \"TORCH_NCCL_DUMP_ON_TIMEOUT\": \"1\",
-    \"TORCH_NCCL_DEBUG_INFO_TEMP_FILE\": \"/mnt/zj-gpfs/output/czh/nccl_trace/rank_\"
+    \"TORCHDYNAMO_DISABLE\": \"1\"
   }
 }"
-# Flight recorder: on watchdog timeout every rank dumps its last 2000 collective records
-# (op type, sizes, seq numbers, state) to the shared fs -> diff ranks to find who never
-# entered the stuck collective. Near-zero overhead while healthy.
-mkdir -p /mnt/zj-gpfs/output/czh/nccl_trace /mnt/zj-gpfs/output/czh/opd_debug
 
 # train.py is resolved relative to the job cwd; run from SLIME_DIR so the script works
 # no matter where it was launched from.
