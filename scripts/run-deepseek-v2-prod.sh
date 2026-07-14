@@ -133,7 +133,8 @@ WANDB_KEY=${WANDB_KEY:?set WANDB_KEY env var (do not hardcode secrets)}
 # ---------------- checkpoint pruner (master only) ----------------
 # slime has no ckpt rotation and each ckpt is ~413GB: keep only the newest 2
 # iter_* dirs so --save-interval 6 cannot fill the 1.4TB filesystem.
-SAVE_DIR=/mnt/zj-gpfs/output/czh/DeepSeek-V2-021A_slime_opd
+SAVE_DIR=${SAVE_DIR:-/mnt/zj-gpfs/output/czh/DeepSeek-V2-021A_slime_opd}
+PROMPT_DATA=${PROMPT_DATA:-/mnt/zj-gpfs/home/czh/dapo-math-17k.jsonl}
 cat > /root/ckpt_pruner.sh <<PREOF
 while true; do
   ls -d ${SAVE_DIR}/iter_* 2>/dev/null | sort -t_ -k2 -n | head -n -2 | while read -r d; do
@@ -174,7 +175,7 @@ CKPT_ARGS=(
    # 1.4TB; with --save-interval 6 a pruner on the master (see below) keeps only
    # the newest 2 ckpts (peak ~1.24TB during the 3rd write). History comes from
    # the every-20-steps in-training eval, not from checkpoints.
-   --save /mnt/zj-gpfs/output/czh/DeepSeek-V2-021A_slime_opd/
+   --save "${SAVE_DIR}/"
    # Each checkpoint is ~413GB (bf16 weights + fp32 optimizer distcp). WARNING: no auto-cleanup
    # -- checkpoints accumulate. The save FS has only ~1.7TB free (shared, 99% full), so ~4
    # checkpoints fill it; delete old iter_* manually or raise --save-interval if it fills up.
@@ -186,7 +187,7 @@ ROLLOUT_ARGS=(
    # reward is identically zero and labels are never read. Any prompt set in the
    # target domain works; --label-key stays so eval / future hybrid runs need no
    # data change.
-   --prompt-data /mnt/zj-gpfs/home/czh/dapo-math-17k.jsonl
+   --prompt-data "${PROMPT_DATA}"
    --input-key prompt
    --label-key label
    --apply-chat-template

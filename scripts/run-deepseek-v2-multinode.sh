@@ -133,6 +133,8 @@ source "${SLIME_DIR}/scripts/models/deepseek-v2.sh"
 # (Megatron MLA, via MLA_ROPE_SCALING_MAPPING) and sglang read rope from this config, so
 # train / rollout / eval all run consistently at YaRN factor-2 / 65536 context.
 HF_CKPT="/mnt/data/data/home/czh/RL/dsv2-021A-cotgeo-yarn2-65536"
+SAVE_DIR=${SAVE_DIR:-/mnt/data/data/home/czh/RL/DeepSeek-V2-021A_slime_dapo_overlong}
+PROMPT_DATA=${PROMPT_DATA:-/mnt/zj-gpfs/home/czh/dapo-math-17k.jsonl}
 
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CKPT}"
@@ -141,7 +143,7 @@ CKPT_ARGS=(
    # iter_XXXXXXX/), and keep --ref-load on the HF checkpoint.
    --ref-load "${HF_CKPT}"
    --load "${HF_CKPT}"
-   --save /mnt/data/data/home/czh/RL/DeepSeek-V2-021A_slime_dapo_overlong/
+   --save "${SAVE_DIR}/"
    # Each checkpoint is ~413GB (bf16 weights + fp32 optimizer distcp). WARNING: no auto-cleanup
    # -- checkpoints accumulate. The save FS has only ~1.7TB free (shared, 99% full), so ~4
    # checkpoints fill it; delete old iter_* manually or raise --save-interval if it fills up.
@@ -149,7 +151,7 @@ CKPT_ARGS=(
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /mnt/zj-gpfs/home/czh/dapo-math-17k.jsonl
+   --prompt-data "${PROMPT_DATA}"
    --input-key prompt
    --label-key label
    --apply-chat-template
