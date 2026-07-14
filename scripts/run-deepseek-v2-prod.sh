@@ -213,6 +213,12 @@ ROLLOUT_ARGS=(
    --balance-data
 )
 
+# Render eval config template now so EVAL_CONFIG_RENDERED is set before the array is defined
+# (bash expands array elements at definition time, not at use time).
+EVAL_CONFIG_RENDERED=/tmp/eval-config-deepseek-v2.yaml
+export EVAL_DATA_AIME
+envsubst < "${SLIME_DIR}/scripts/eval-config-deepseek-v2.yaml" > "${EVAL_CONFIG_RENDERED}"
+
 EVAL_ARGS=(
    --eval-interval 20
    # Dataset config moved to YAML: it also tags eval samples with metadata is_eval=true so
@@ -375,11 +381,6 @@ RUNTIME_ENV_JSON="{
     \"TORCHDYNAMO_DISABLE\": \"1\"
   }
 }"
-
-# Render eval config template (path substitution via envsubst).
-EVAL_CONFIG_RENDERED=/tmp/eval-config-deepseek-v2.yaml
-export EVAL_DATA_AIME
-envsubst < "${SLIME_DIR}/scripts/eval-config-deepseek-v2.yaml" > "${EVAL_CONFIG_RENDERED}"
 
 # train.py is resolved relative to the job cwd; run from SLIME_DIR so the script works
 # no matter where it was launched from.
