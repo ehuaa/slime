@@ -15,7 +15,7 @@ eval:
       # --rm-type is not deepscaler (the pure-OPD run uses --rm-type zero).
       # No effect on runs with --custom-rm-path (it short-circuits dispatch first).
       rm_type: deepscaler
-      path: /mnt/zj-gpfs/home/czh/aime-2024.jsonl
+      path: ${EVAL_DATA_AIME}
       n_samples_per_eval_prompt: 16
       # longest aime prompt is 371 tok, so 371+64000=64371 <= 65536 context.
       max_response_len: 64000

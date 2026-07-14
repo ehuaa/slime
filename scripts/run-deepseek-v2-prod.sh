@@ -135,6 +135,7 @@ WANDB_KEY=${WANDB_KEY:?set WANDB_KEY env var (do not hardcode secrets)}
 # iter_* dirs so --save-interval 6 cannot fill the 1.4TB filesystem.
 SAVE_DIR=${SAVE_DIR:-/mnt/zj-gpfs/output/czh/DeepSeek-V2-021A_slime_opd}
 PROMPT_DATA=${PROMPT_DATA:-/mnt/zj-gpfs/home/czh/dapo-math-17k.jsonl}
+EVAL_DATA_AIME=${EVAL_DATA_AIME:-/mnt/zj-gpfs/home/czh/aime-2024.jsonl}
 cat > /root/ckpt_pruner.sh <<PREOF
 while true; do
   ls -d ${SAVE_DIR}/iter_* 2>/dev/null | sort -t_ -k2 -n | head -n -2 | while read -r d; do
@@ -216,7 +217,7 @@ EVAL_ARGS=(
    --eval-interval 20
    # Dataset config moved to YAML: it also tags eval samples with metadata is_eval=true so
    # the dapo_overlong custom RM skips reward shaping during eval (scores = pure accuracy).
-   --eval-config "${SLIME_DIR}/scripts/eval-config-deepseek-v2.yaml"
+   --eval-config "${EVAL_CONFIG_RENDERED}"
    --eval-max-context-len 65536
 )
 
@@ -374,6 +375,11 @@ RUNTIME_ENV_JSON="{
     \"TORCHDYNAMO_DISABLE\": \"1\"
   }
 }"
+
+# Render eval config template (path substitution via envsubst).
+EVAL_CONFIG_RENDERED=/tmp/eval-config-deepseek-v2.yaml
+export EVAL_DATA_AIME
+envsubst < "${SLIME_DIR}/scripts/eval-config-deepseek-v2.yaml" > "${EVAL_CONFIG_RENDERED}"
 
 # train.py is resolved relative to the job cwd; run from SLIME_DIR so the script works
 # no matter where it was launched from.

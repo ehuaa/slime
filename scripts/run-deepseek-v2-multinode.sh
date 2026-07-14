@@ -135,6 +135,7 @@ source "${SLIME_DIR}/scripts/models/deepseek-v2.sh"
 HF_CKPT="/mnt/data/data/home/czh/RL/dsv2-021A-cotgeo-yarn2-65536"
 SAVE_DIR=${SAVE_DIR:-/mnt/data/data/home/czh/RL/DeepSeek-V2-021A_slime_dapo_overlong}
 PROMPT_DATA=${PROMPT_DATA:-/mnt/zj-gpfs/home/czh/dapo-math-17k.jsonl}
+EVAL_DATA_AIME=${EVAL_DATA_AIME:-/mnt/zj-gpfs/home/czh/aime-2024.jsonl}
 
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CKPT}"
@@ -197,7 +198,7 @@ EVAL_ARGS=(
    --eval-interval 20
    # Dataset config moved to YAML: it also tags eval samples with metadata is_eval=true so
    # the dapo_overlong custom RM skips reward shaping during eval (scores = pure accuracy).
-   --eval-config "${SLIME_DIR}/scripts/eval-config-deepseek-v2.yaml"
+   --eval-config "${EVAL_CONFIG_RENDERED}"
    --eval-max-context-len 65536
 )
 
@@ -366,6 +367,11 @@ RUNTIME_ENV_JSON="{
     \"TORCHDYNAMO_DISABLE\": \"1\"
   }
 }"
+
+# Render eval config template (path substitution via envsubst).
+EVAL_CONFIG_RENDERED=/tmp/eval-config-deepseek-v2.yaml
+export EVAL_DATA_AIME
+envsubst < "${SLIME_DIR}/scripts/eval-config-deepseek-v2.yaml" > "${EVAL_CONFIG_RENDERED}"
 
 # train.py is resolved relative to the job cwd; run from SLIME_DIR so the script works
 # no matter where it was launched from.
