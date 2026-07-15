@@ -196,13 +196,15 @@ ROLLOUT_ARGS=(
    # sample. Eval is NOT affected: eval-config-deepseek-v2.yaml pins aime to
    # rm_type deepscaler (per-dataset override via sample.metadata).
    --rm-type zero
-   --num-rollout 100
+   # Overridable for smoke tests (e.g. NUM_ROLLOUT=2 for a quick debug-flow check).
+   --num-rollout ${NUM_ROLLOUT:-100}
    # NO dynamic-sampling filter and NO over-sampling: under pure OPD every group
    # is zero-std and the nonzero-std filter would drop 100% of the data.
    # Distillation wants prompt coverage, not group contrast: more prompts
    # (rbs 64) x fewer samples each (n 4). 64*4 = 256 = GBS -> exactly ONE
    # on-policy update per rollout.
-   --rollout-batch-size 512
+   # Overridable for smoke tests (e.g. ROLLOUT_BATCH_SIZE=32 for a fast rollout).
+   --rollout-batch-size ${ROLLOUT_BATCH_SIZE:-512}
    --n-samples-per-prompt 4
    # Same YaRN factor-2 / 65536 window as production.
    --rollout-max-response-len 64000
@@ -382,13 +384,17 @@ RUNTIME_ENV_JSON="{
     \"TORCHDYNAMO_DISABLE\": \"1\",
     \"TORCH_NCCL_TRACE_BUFFER_SIZE\": \"2000\",
     \"TORCH_NCCL_DUMP_ON_TIMEOUT\": \"1\",
-    \"TORCH_NCCL_DEBUG_INFO_TEMP_FILE\": \"/mnt/zj-gpfs/output/czh/nccl_trace/rank_\"
+    \"TORCH_NCCL_DEBUG_INFO_TEMP_FILE\": \"/mnt/zj-gpfs/output/czh/nccl_trace/rank_\",
+    \"NCCL_DEBUG\": \"${NCCL_DEBUG:-WARN}\",
+    \"SLIME_HANG_TRACE\": \"${SLIME_HANG_TRACE:-0}\",
+    \"SLIME_HANG_TRACE_COLL\": \"${SLIME_HANG_TRACE_COLL:-0}\",
+    \"SLIME_HANG_TRACE_DIR\": \"${SLIME_HANG_TRACE_DIR:-/mnt/zj-gpfs/output/czh/hang_trace}\"
   }
 }"
 # Flight recorder: on watchdog timeout every rank dumps its last 2000 collective records
 # (op type, sizes, seq numbers, state) to the shared fs -> diff ranks to find who never
 # entered the stuck collective. Near-zero overhead while healthy.
-mkdir -p /mnt/zj-gpfs/output/czh/nccl_trace /mnt/zj-gpfs/output/czh/opd_debug
+mkdir -p /mnt/zj-gpfs/output/czh/nccl_trace /mnt/zj-gpfs/output/czh/opd_debug "${SLIME_HANG_TRACE_DIR:-/mnt/zj-gpfs/output/czh/hang_trace}"
 
 # train.py is resolved relative to the job cwd; run from SLIME_DIR so the script works
 # no matter where it was launched from.

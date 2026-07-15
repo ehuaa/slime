@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import torch
 import torch.distributed as dist
 
+from slime.utils import hang_tracer
 from slime.utils.memory_utils import available_memory, clear_memory, print_memory
 
 logger = logging.getLogger(__name__)
@@ -207,6 +208,13 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
         inner = self.group
         if inner is None:
             raise RuntimeError("ReloadableProcessGroup: inner PG is None, call reload() first.")
+        # [hang-trace] opt-in per-collective tracer; no-op unless SLIME_HANG_TRACE_COLL=1
+        if hang_tracer.TRACE_COLL_ENABLED:
+            hang_tracer.trace_coll_call(method, self.group_info["ranks"], args)
+            with _wrap_low_level_call(check_memory=_should_check_memory_for_comm(method)):
+                ret = getattr(inner, method)(*args, **kwargs)
+            hang_tracer.trace_coll_ret(method, self.group_info["ranks"])
+            return ret
         with _wrap_low_level_call(check_memory=_should_check_memory_for_comm(method)):
             return getattr(inner, method)(*args, **kwargs)
 

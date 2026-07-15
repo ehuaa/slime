@@ -226,9 +226,22 @@ def gather_and_reduce_log_dict(
     this helper stays free of side effects so CPU multi-process unit tests
     can drive it directly with real ``torch.distributed``.
     """
+    # [hang-trace] the gloo gather_object below is the observed hang site; logging
+    # the key-set is cheap and a per-rank key mismatch would itself stall the gather.
+    from slime.utils import hang_tracer
+
+    hang_tracer.trace(
+        "PHASE gather_log:enter",
+        dp_src=dp_src_rank,
+        is_src=int(dist.get_rank() == dp_src_rank),
+        nkeys=len(log_dict),
+        keys="|".join(sorted(log_dict)),
+    )
+
     if dist.get_rank() == dp_src_rank:
         gathered = [None] * dp_size
         dist.gather_object(log_dict, gathered, dst=dp_src_rank, group=dp_group)
+        hang_tracer.trace("PHASE gather_log:exit", is_src=1)
         reduced: dict = {}
         for key in log_dict:
             values = [d[key] for d in gathered]
@@ -241,6 +254,7 @@ def gather_and_reduce_log_dict(
                 reduced[key] = sum(values) / dp_size
         return reduced
     dist.gather_object(log_dict, None, dst=dp_src_rank, group=dp_group)
+    hang_tracer.trace("PHASE gather_log:exit", is_src=0)
     return None
 
 

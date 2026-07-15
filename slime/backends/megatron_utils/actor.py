@@ -13,7 +13,7 @@ from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoTokenizer
 
 from slime.ray.train_actor import TrainRayActor
-from slime.utils import train_dump_utils
+from slime.utils import hang_tracer, train_dump_utils
 from slime.utils.data import process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.logging_utils import init_tracking
@@ -443,6 +443,14 @@ class MegatronTrainRayActor(TrainRayActor):
         num_microbatches = rollout_data["num_microbatches"]
         global_batch_sizes = rollout_data["global_batch_sizes"]
 
+        # [hang-trace] phase markers; no-op unless SLIME_HANG_TRACE=1
+        hang_tracer.trace(
+            "PHASE train_actor:enter",
+            rollout_id=rollout_id,
+            n_gbs=len(num_microbatches),
+            n_mbs=sum(num_microbatches),
+        )
+
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
 
@@ -452,6 +460,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                     self._switch_model("ref")
+                    hang_tracer.trace("PHASE log_prob:ref", rollout_id=rollout_id)
                     rollout_data.update(
                         self.compute_log_prob(
                             data_iterator,
@@ -465,6 +474,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                     self._switch_model("teacher")
+                    hang_tracer.trace("PHASE log_prob:teacher", rollout_id=rollout_id)
                     rollout_data.update(
                         self.compute_log_prob(
                             data_iterator,
@@ -494,6 +504,7 @@ class MegatronTrainRayActor(TrainRayActor):
                             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
                         else:
                             os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                    hang_tracer.trace("PHASE log_prob:actor", rollout_id=rollout_id)
                     rollout_data.update(
                         self.compute_log_prob(
                             data_iterator,
@@ -516,21 +527,29 @@ class MegatronTrainRayActor(TrainRayActor):
 
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
+                hang_tracer.trace("PHASE compute_advantages:enter", rollout_id=rollout_id)
                 compute_advantages_and_returns(self.args, rollout_data)
+                hang_tracer.trace("PHASE compute_advantages:exit", rollout_id=rollout_id)
 
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args, rollout_id, rollout_data)
 
+            # [hang-trace] gloo gather_object over the DP group lives inside here;
+            # a rank stuck at log_rollout_data:enter while peers hit train:enter is
+            # the exact desync signature of the observed hang.
+            hang_tracer.trace("PHASE log_rollout_data:enter", rollout_id=rollout_id)
             log_rollout_data(
                 rollout_id,
                 self.args,
                 rollout_data,
             )
+            hang_tracer.trace("PHASE log_rollout_data:exit", rollout_id=rollout_id)
 
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
             with timer("actor_train"):
+                hang_tracer.trace("PHASE train:enter", rollout_id=rollout_id)
                 train(
                     rollout_id,
                     self.model,
@@ -540,6 +559,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     num_microbatches,
                     global_batch_sizes,
                 )
+                hang_tracer.trace("PHASE train:exit", rollout_id=rollout_id)
 
             self.prof.step(rollout_id=rollout_id)
 
