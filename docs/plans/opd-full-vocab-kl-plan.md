@@ -300,3 +300,158 @@ teacher 投产(arguments.py:1696 仅 logger.info)。
 
 M1a 0.5 天 → M2 1 天 → M3 0.5 天 → M4 0.5 天(脚本已在,只做自蒸馏冒烟 + K 扫描),
 合计 **2.5~3 天**(不含 M1b 对照 +1 天、M5)。
+
+---
+
+## 7. megatron-mode OPD 运行机制知识点(代码实录,2026-07-15)
+
+> 以档1 `scripts/run-deepseek-v2-opd.sh` 为参照(DeepSeek-V2 021A,4 机 × 8 卡 = 32,
+> colocate,tp4·cp4·ep16)。纯 OPD:`--rm-type zero` 使每条 task reward = 0,GRPO 从
+> reward 得到的 advantage 恒为 0,**唯一**学习信号是 student 与 teacher 的逐 token 反向 KL。
+
+### 7.1 一个 rollout 的端到端流程
+
+```
+[rollout_id == 0] 先 eval(deepscaler 打分)              # train.py:68,除非 --skip-eval-before-train
+                                                          #(debug 脚本里 EVAL_ARGS=() 关掉了)
+每个 rollout:
+  1. rollout 生成
+       8 个 sglang engine(每 4 卡一个,ep4/dp4)并行生成 student 的 token 序列 + rollout logprobs
+  2. train_actor(colocate:同一批 32 卡当作【一个】Megatron 并行组 tp4·cp4·ep16,
+                 不是 8 个 4 卡小 engine):
+       a. _switch_model("ref")     -> Megatron forward -> ref_log_probs
+       b. _switch_model("teacher") -> Megatron forward -> teacher_log_probs   # 共 3 次 logprob 前向
+       c. _switch_model("actor")   -> Megatron forward -> log_probs(student "old")
+       d. compute_advantages_and_returns
+             -> apply_opd_kl_to_advantages:
+                advantage = reward_adv(=0) - opd_kl_coef · (student_old_logp - teacher_logp)
+       e. log_rollout_data          (在 DP 组上做 gloo gather_object)
+       f. train():  for step_id in range(num_steps_per_rollout): 前向 + 反向 + 优化器步
+```
+
+要点:
+- **每个 rollout 固定 3 次 logprob 前向**(ref、teacher、student-old),与 `num_steps_per_rollout` 无关。
+  这个 "3" 不要和 `num_steps_per_rollout` 的 "4" 混淆。
+- `ref` 仍会算(ref-load 存在),尽管 `--kl-loss-coef 0` 使它不进 loss。
+- teacher 前向走自己的自然路由(`ROUTING_REPLAY_STAGE=fallthrough`);只有 student 的**训练**前向
+  回放 rollout 的 MoE 路由(R3)。
+- colocate:sglang 生成完后把其权重/KV offload 掉,Megatron 原地在这同一批 32 卡上跑。
+
+实测 log(rollout 0,rbs32·n4):
+```
+teacher_log_probs = -0.507
+ref_log_probs     = -0.364
+log_probs(actor)  = -0.362
+opd_reverse_kl    =  0.145  = log_probs - teacher_log_probs
+advantages        = -0.145  = -opd_kl_coef · opd_reverse_kl     (coef = 1.0)
+rewards = raw_reward = 0.0  (rm-type zero -> KL 是全部信号)
+```
+
+### 7.2 num_steps_per_rollout:1 与 4 的区别
+
+分水岭一行(`slime/utils/arguments.py:1844`):
+```
+global_batch_size = rollout_batch_size * n_samples_per_prompt // num_steps_per_rollout
+```
+
+**完全不变的部分(每个 rollout 只算一次,覆盖全部数据):** rollout 生成、3 次 logprob 前向、
+student−teacher 的 KL 与 advantages、log_rollout_data。
+
+**变的只有 `train()` 循环**(`model.py:730`):
+
+| | num_steps = 1 | num_steps = 4 |
+|---|---|---|
+| 优化器步数/rollout | 1 | 4(数据切 4 块,顺序各走一步) |
+| GBS/步 | rbs·n 全部 | rbs·n / 4 |
+| on/off-policy | 完全 on-policy,ratio=exp(π_cur−π_old)=1,clip 不触发 | step0 on-policy;**step1–3 off-policy**(权重已动),ratio≠1,`--eps-clip 0.2/0.28` 真正起作用 |
+| 蒸馏目标 | 学一次 | teacher_logp / advantages **冻结**,student 朝静态目标被推 4 次 |
+
+- 总优化器步数 = `num_rollout × num_steps_per_rollout`。
+- **显存峰值不随 num_steps 变**——由 `--max-tokens-per-gpu` 封顶,切多步只是每步 GBS 更小、步数更多。
+
+实测 per-step log(rollout 0,num_steps=4):step0 `pg_clipfrac=0`、`ppo_kl=0`(on-policy)→
+step1-3 `pg_clipfrac>0`、`ppo_kl>0`(off-policy 漂移),即 num_steps=4 行为的实证;
+`train_rollout_logprob_abs_diff ≈ 0.011–0.015` 是 R3 路由回放后的 train/infer 对齐度。
+
+### 7.3 一次算好的 advantage 如何切给 4 步并分别反传
+
+核心:**advantage 不是被单独切开的对象——它是挂在每条样本上的 per-token 张量;真正被切分的是
+"样本",advantage 跟着样本走。**
+
+1. **advantage 算一次,冻结。** `compute_advantages_and_returns` 填 `rollout_data["advantages"]`
+   (列表,每条样本一个 per-token 张量)。OPD(`loss.py:565`):
+   ```python
+   for i, adv in enumerate(advantages):
+       reverse_kl = student_log_probs[i] - teacher_log_probs[i]
+       advantages[i] = adv - args.opd_kl_coef * reverse_kl   # reward=0 -> adv=0
+   ```
+   `normalize_advantages`(若开)白化也在这里一次性对整个 DP 组做。
+
+2. **调度按 group 切样本**(`slime/utils/dp_schedule.py build_dp_schedule`):
+   - 样本按 `group_id` 分组(一条 prompt 的 n 个样本绑在一起);
+   - `num_steps = len(group_ids) // global_batch_size`,每步取一段连续 group:
+     `group_ids[step_i*gbs:(step_i+1)*gbs]`;
+   - 步内按 token 预算(`max_tokens_per_gpu·cp`,dynamic)装 microbatch,再分到各 dp rank;
+   - 产物三件套存进 `rollout_data`:`global_batch_sizes=[32,32,32,32]`、
+     `num_microbatches=[m0..m3]`、`micro_batch_indices`(4 步的 microbatch 首尾拼成扁平列表)。
+
+3. **`train()` 顺序消费同一迭代器**(`model.py:730`):
+   ```python
+   for step_id in range(num_steps_per_rollout):
+       train_one_step(..., num_microbatches[step_id], global_batch_sizes[step_id])
+   ```
+   `DataIterator.get_next`(`data.py:238`)靠 `offset` 前进:step0 吃前 m0 个 microbatch,
+   step1 接着吃 m1 个……4 块天然切开。每个 microbatch 把该批样本的
+   `advantages / log_probs(old) / teacher_log_probs / rollout_log_probs / loss_masks` 一起取出。
+
+4. **每步 loss 与反传**(`loss.py:896`):
+   ```python
+   ppo_kl  = old_log_probs - log_probs                 # old 是冻结的 actor 前向;log_probs 是实时算的
+   pg_loss = compute_policy_loss(ppo_kl, advantages, eps_clip, eps_clip_high)
+   #        = -advantage · min(ratio, clip(ratio)), ratio = exp(-ppo_kl) = exp(log_probs - old_log_probs)
+   ```
+   Megatron `forward_backward_func` 对该步的每个 microbatch 逐个 backward **累积梯度**,
+   跑完该步才 **一次 `optimizer.step()` + 清梯度**。下一步在**更新后的权重**上跑,其实时
+   `log_probs` 与冻结的 `old_log_probs` 不同 → ratio≠1 → off-policy 修正/裁剪生效。
+
+一句话:**"切 advantage" == "切样本";4 步各吃 1/4 样本(连带它们冻结的
+advantage/old_logp/teacher_logp),前向实时算新 logp 得 ratio,PPO-clip 后在该步内 microbatch
+累积梯度、一次更新,下一步在新权重上重复。**
+
+### 7.4 can_reuse_log_probs_in_loss(actor.py:477)
+
+纯**性能**优化:省掉单独的 student-old 前向,直接复用训练前向的 log_probs 当 old。仅当权重在更新点
+保证未变(`len(num_microbatches)==1`)且一堆"无需独立前向"的条件(`kl_coef==0`、非 critic、非 gspo、
+**非 use_opd**、非 routing_replay…)同时成立时才为真。
+
+- 生效时数学上恒等(两条路径 ratio 都精确=1)→ **对 reward 方差/震荡无影响**,只省一次前向。
+- **OPD 下恒为 False**(`and not self.args.use_opd`),参照 run 始终走独立 student-old 前向。
+- 想压 GRPO 的 reward 震荡应调 `n_samples_per_prompt`、GBS、advantage 归一化、clip range、lr,不是这个 flag。
+
+### 7.5 排障插桩(commit 05d3400)与冒烟结果
+
+`slime/utils/hang_tracer.py`——env 门控、关闭时零开销、绝不触发 CUDA 同步。
+- `SLIME_HANG_TRACE=1`:phase 打点(便宜)覆盖 `train_actor` 各阶段 + gloo `gather_object`
+  命中点(`cp_utils.gather_and_reduce_log_dict`,记录每 rank 的 key 集合)。
+- `SLIME_HANG_TRACE_COLL=1`:opt-in 的 per-collective CALL/RET 追踪(在
+  `ReloadableProcessGroup._fwd`,重)。
+- `SLIME_HANG_TRACE_DIR`:输出目录(默认 `/mnt/zj-gpfs/output/czh/hang_trace`),每 rank 一个
+  append-only `trace_rank{r}_pid{p}.log`,放共享盘。
+- `run-deepseek-v2-opd.sh` 把上述 + `NCCL_DEBUG` 经 `RUNTIME_ENV_JSON` 透传(默认关),
+  并把 `--rollout-batch-size`/`--num-rollout` 做成可覆盖(`ROLLOUT_BATCH_SIZE`/`NUM_ROLLOUT`),默认仍 512/100。
+
+排障流程(参考 sglang debug-distributed-hang):
+1. `grep ' PHASE ' trace_rank000_* | tail` 对比另一个 rank → 看谁卡在哪。观测到的 hang 签名 =
+   一批 rank 在 `log_rollout_data`/`gather_log:enter`,另一批已到 `train:enter`。
+2. `grep gather_log:enter ... | sort -u` 看 key 集合 → 若各 rank key 不一致会直接让 gloo gather
+   死锁(**代码** bug,不是网络)。
+3. 开 COLL 后:有 CALL 无 RET = 卡在同步 collective(如 gloo gather)里;last-COLL seq 落后 =
+   那个 rank 根本没走到该 collective。
+4. 配合 PyTorch flight recorder(`TORCH_NCCL_TRACE_BUFFER_SIZE`/`DUMP_ON_TIMEOUT`)与 py-spy 哨兵。
+
+冒烟结果(2026-07-15,集群 ji-jupyter-159341802799263168,rbs32·num_rollout2):
+- job succeeded;32/32 rank 收尾于 `train:exit rollout_id=1`(同步,无 desync)。
+- gather_log key 集合全 rank/全 rollout 恒为 1 种(无 key 不一致)。
+- 共 8 个 train step(2 rollout × 4)。NCCL 走 **IB/GDRDMA**(非 socket 回退)。
+- 这台集群顺利越过上次某集群挂死的点 → 之前那次 hang 更像瞬时/基础设施问题(高网络 I/O 下某个
+  peer 的 gloo 连接被断开),不是代码 bug。
