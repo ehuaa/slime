@@ -200,16 +200,25 @@ ROLLOUT_ARGS=(
    --num-rollout 100
    # NO dynamic-sampling filter and NO over-sampling: under pure OPD every group
    # is zero-std and the nonzero-std filter would drop 100% of the data.
-   # Distillation wants prompt coverage, not group contrast: more prompts
-   # (rbs 64) x fewer samples each (n 4). 64*4 = 256 = GBS -> exactly ONE
-   # on-policy update per rollout.
+   # rbs 512 x n 4 = 2048 samples feed ONE fully on-policy update per rollout
+   # (--num-steps-per-rollout 1 below): gbs 2048, activations still bounded by
+   # --max-tokens-per-gpu (gbs only adds accumulation microbatches). Staleness,
+   # not batch size, collapsed run htmq2aul (num-steps 4 = 3 stale clipped
+   # updates per rollout -> entropy -16%, repetition_frac 0 -> 9% by rollout
+   # 14). 2048 concurrent samples also keep the 8 colocated sglang engines
+   # decode-saturated; a smaller batch drains the long-response tail at tiny
+   # per-engine concurrency for nearly the same wall time.
    --rollout-batch-size 512
    --n-samples-per-prompt 4
    # Same YaRN factor-2 / 65536 window as production.
    --rollout-max-response-len 64000
    --rollout-max-context-len 65536
    --rollout-temperature 1
-   --num-steps-per-rollout 4
+   --num-steps-per-rollout 1
+   # Truncated (no-EOS) samples still carry full per-token KL gradient but never
+   # show a stop decision -> training on them feeds the length/repetition
+   # runaway. Mask them out (loss_mask zeroed downstream, batch geometry kept).
+   --rollout-sample-filter-path slime.rollout.filter_hub.sample_filters.mask_truncated_samples
    --balance-data
 )
 
@@ -220,7 +229,10 @@ export EVAL_DATA_AIME
 envsubst < "${SLIME_DIR}/scripts/eval-config-deepseek-v2.yaml" > "${EVAL_CONFIG_RENDERED}"
 
 EVAL_ARGS=(
-   --eval-interval 20
+   # Every 5 rollouts: htmq2aul only got one eval before collapsing at rollout
+   # 14 -- with num-steps 1 each rollout is one optimizer step, so 5 is cheap
+   # insurance for catching repetition/entropy drift early.
+   --eval-interval 5
    # Dataset config moved to YAML: it also tags eval samples with metadata is_eval=true so
    # the dapo_overlong custom RM skips reward shaping during eval (scores = pure accuracy).
    --eval-config "${EVAL_CONFIG_RENDERED}"
