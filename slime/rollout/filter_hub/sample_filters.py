@@ -1,23 +1,28 @@
 from slime.utils.types import Sample
+from slime.utils.metric_utils import has_repetition
 
 __all__ = ["mask_truncated_samples"]
 
 
 def mask_truncated_samples(args, data):
-    """Flag truncated (no-EOS) samples so training zeroes their loss.
+    """Mask only *repetitive* truncated samples; leave clean truncated samples alone.
 
-    A truncated sequence never shows the model a stop decision, so training on
-    it (dense per-token KL under OPD) pushes toward "never stop" and feeds the
-    length/repetition runaway. Flagging ``remove_sample`` (instead of deleting)
-    keeps group structure and batch geometry intact; the train-data builder
-    turns the flag into an all-zero loss mask.
+    OPD has a built-in length disincentive: when the student overshoots the
+    teacher's natural stopping point, teacher_logp << student_logp for those
+    tokens, so advantage turns negative. Zeroing the loss on all truncated
+    samples silently removes this signal and lets response length drift up.
+
+    We therefore only zero-mask samples that are both truncated AND repetitive
+    (the degenerate loop case that caused htmq2aul collapse). Non-repetitive
+    truncated samples keep their full KL loss so the natural length penalty
+    remains active.
     """
 
     def _walk(node):
         if isinstance(node, list):
             for item in node:
                 _walk(item)
-        elif node.status == Sample.Status.TRUNCATED:
+        elif node.status == Sample.Status.TRUNCATED and has_repetition(node.response):
             node.remove_sample = True
 
     _walk(data)
