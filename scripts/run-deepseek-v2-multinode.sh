@@ -174,7 +174,7 @@ ROLLOUT_ARGS=(
    # ABSOLUTE endpoint, not a delta: train.py loops range(start_rollout_id, num_rollout).
    # Resuming at rollout_id 100, so 200 = another 100 steps (saves land at 119/139/159/179/199
    # per --save-interval 20). Raise this if you want to train further.
-   --num-rollout 200
+   --num-rollout 100
    # DAPO-style dynamic sampling (validated 2026-07-03 on 16 GPUs): target 128 VALID groups
    # per step (nonzero reward std; all-correct/all-wrong groups carry zero advantage = zero
    # gradient and are dropped — unfiltered runs wasted 78% of samples). At 64 GPUs the os=512
