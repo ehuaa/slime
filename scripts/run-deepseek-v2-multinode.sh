@@ -139,11 +139,14 @@ EVAL_DATA_AIME=${EVAL_DATA_AIME:-/mnt/zj-gpfs/home/czh/aime-2024.jsonl}
 
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CKPT}"
-   # First run: init both actor (--load) and reference (--ref-load) from the HF checkpoint.
-   # To RESUME after a save, change --load to the slime save dir below (which then holds
-   # iter_XXXXXXX/), and keep --ref-load on the HF checkpoint.
+   # RESUME mode: --load points at the slime save dir (holds latest_checkpointed_iteration.txt
+   # = 99 + iter_0000099/). In bridge mode slime detects the Megatron checkpoint there and
+   # loads weights + optimizer + RNG, resuming at rollout_id 100 (loaded_id 99 + 1); the
+   # rollout/ subdir restores the dataloader position too. --ref-load STAYS on the HF
+   # checkpoint so the KL anchor remains the initial policy. To start a FRESH run instead,
+   # point --load back at "${HF_CKPT}" (start_rollout_id resets to 0).
    --ref-load "${HF_CKPT}"
-   --load "${HF_CKPT}"
+   --load "${SAVE_DIR}/"
    --save "${SAVE_DIR}/"
    # Each checkpoint is ~413GB (bf16 weights + fp32 optimizer distcp). WARNING: no auto-cleanup
    # -- checkpoints accumulate. The save FS has only ~1.7TB free (shared, 99% full), so ~4
@@ -168,7 +171,10 @@ ROLLOUT_ARGS=(
    # such groups PASS the std filter and deliver the length-pressure gradient. Eval
    # rewards are NOT shaped (is_eval metadata guard). Buffer: env DAPO_OVERLONG_BUFFER.
    --custom-rm-path slime.rollout.rm_hub.dapo_overlong.custom_rm
-   --num-rollout 100
+   # ABSOLUTE endpoint, not a delta: train.py loops range(start_rollout_id, num_rollout).
+   # Resuming at rollout_id 100, so 200 = another 100 steps (saves land at 119/139/159/179/199
+   # per --save-interval 20). Raise this if you want to train further.
+   --num-rollout 200
    # DAPO-style dynamic sampling (validated 2026-07-03 on 16 GPUs): target 128 VALID groups
    # per step (nonzero reward std; all-correct/all-wrong groups carry zero advantage = zero
    # gradient and are dropped — unfiltered runs wasted 78% of samples). At 64 GPUs the os=512
@@ -199,7 +205,7 @@ export EVAL_DATA_AIME
 envsubst < "${SLIME_DIR}/scripts/eval-config-deepseek-v2.yaml" > "${EVAL_CONFIG_RENDERED}"
 
 EVAL_ARGS=(
-   --eval-interval 20
+   --eval-interval 10
    # Dataset config moved to YAML: it also tags eval samples with metadata is_eval=true so
    # the dapo_overlong custom RM skips reward shaping during eval (scores = pure accuracy).
    --eval-config "${EVAL_CONFIG_RENDERED}"
