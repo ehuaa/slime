@@ -197,7 +197,7 @@ export EVAL_DATA_AIME
 envsubst < "${SLIME_DIR}/scripts/eval-config-deepseek-v2.yaml" > "${EVAL_CONFIG_RENDERED}"
 
 EVAL_ARGS=(
-   --eval-interval 10
+   --eval-interval 5
    # Dataset config moved to YAML: it also tags eval samples with metadata is_eval=true so
    # the dapo_overlong custom RM skips reward shaping during eval (scores = pure accuracy).
    --eval-config "${EVAL_CONFIG_RENDERED}"
@@ -245,7 +245,7 @@ GRPO_ARGS=(
    # ladder if entropy still climbs after 20-40 steps: 5e-3 / 1e-2 (GRPO paper default
    # 0.04 = strong anchor), or cut --eps-clip-high to 0.22-0.24 instead. Watch rollout/kl:
    # healthy is a slow climb staying < ~0.05/token; pinned at 0 means anchor too tight.
-   --kl-loss-coef 1e-3
+   --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
    --eps-clip 0.2
