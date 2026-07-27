@@ -139,14 +139,12 @@ EVAL_DATA_AIME=${EVAL_DATA_AIME:-/mnt/zj-gpfs/home/czh/aime-2024.jsonl}
 
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CKPT}"
-   # RESUME mode: --load points at the slime save dir (holds latest_checkpointed_iteration.txt
-   # = 99 + iter_0000099/). In bridge mode slime detects the Megatron checkpoint there and
-   # loads weights + optimizer + RNG, resuming at rollout_id 100 (loaded_id 99 + 1); the
-   # rollout/ subdir restores the dataloader position too. --ref-load STAYS on the HF
-   # checkpoint so the KL anchor remains the initial policy. To start a FRESH run instead,
-   # point --load back at "${HF_CKPT}" (start_rollout_id resets to 0).
+   # FRESH mode: both actor and reference start from the HF checkpoint. No optimizer,
+   # scheduler, RNG, rollout id, or dataloader state is restored, so training starts at
+   # rollout_id 0. IMPORTANT: set SAVE_DIR to a new/empty directory before launching;
+   # reusing the old resume directory would mix this run with its iter_0000099 checkpoint.
    --ref-load "${HF_CKPT}"
-   --load "${SAVE_DIR}/"
+   --load "${HF_CKPT}"
    --save "${SAVE_DIR}/"
    # Each checkpoint is ~413GB (bf16 weights + fp32 optimizer distcp). WARNING: no auto-cleanup
    # -- checkpoints accumulate. The save FS has only ~1.7TB free (shared, 99% full), so ~4
@@ -168,8 +166,8 @@ ROLLOUT_ARGS=(
    # remain pure 0/1 accuracy via the is_eval metadata guard. Buffer: env DAPO_OVERLONG_BUFFER.
    --custom-rm-path slime.rollout.rm_hub.dapo_overlong.custom_rm
    # ABSOLUTE endpoint, not a delta: train.py loops range(start_rollout_id, num_rollout).
-   # Resuming at rollout_id 100, so 200 = another 100 steps (saves land at 119/139/159/179/199
-   # per --save-interval 20). Raise this if you want to train further.
+   # A fresh run starts at rollout_id 0, so 200 means 200 rollout/training iterations.
+   # Raise this endpoint if you want to train further.
    --num-rollout 200
    # Standard DAPO dynamic sampling: keep 64 groups whose raw 0/1 accuracy is non-constant.
    # Generate each 256-group wave to completion, then select valid groups in original prompt
