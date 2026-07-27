@@ -37,12 +37,30 @@ import os
 from slime.utils.types import Sample
 
 from .deepscaler import get_deepscaler_rule_based_reward
+from .zero2one import get_zero2one_rule_based_reward
 
 OVERLONG_BUFFER = int(os.environ.get("DAPO_OVERLONG_BUFFER", 16000))
 
 
+def _get_accuracy(args, sample: Sample) -> float:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    rm_type = (metadata.get("rm_type") or getattr(args, "rm_type", None) or "deepscaler").strip()
+
+    if rm_type == "deepscaler":
+        return float(get_deepscaler_rule_based_reward(sample.response, sample.label))
+    if rm_type == "zero2one":
+        return float(
+            get_zero2one_rule_based_reward(
+                sample.response,
+                sample.label,
+                extract_last_number=bool(metadata.get("extract_last_number", False)),
+            )
+        )
+    raise ValueError(f"dapo_overlong supports rm_type deepscaler or zero2one, got {rm_type!r}")
+
+
 def _reward_one(args, sample: Sample, evaluation: bool) -> float:
-    accuracy = float(get_deepscaler_rule_based_reward(sample.response, sample.label))
+    accuracy = _get_accuracy(args, sample)
     if accuracy not in (0.0, 1.0):
         raise ValueError(f"DAPO accuracy reward must be binary, got {accuracy}")
 

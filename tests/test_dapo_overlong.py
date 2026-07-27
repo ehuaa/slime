@@ -61,6 +61,20 @@ def test_eval_reward_remains_zero_one_accuracy(dapo_args):
 
 
 @pytest.mark.unit
+def test_dapo_overlong_can_select_zero2one_scorer(monkeypatch, dapo_args):
+    monkeypatch.setattr(
+        dapo_overlong,
+        "get_zero2one_rule_based_reward",
+        lambda response, label, *, extract_last_number=False: 1,
+    )
+    dapo_args.rm_type = "zero2one"
+    sample = _sample(response="answer", length=50)
+
+    assert dapo_overlong._reward_one(dapo_args, sample, evaluation=False) == 1.0
+    assert sample.metadata["raw_reward"] == 1.0
+
+
+@pytest.mark.unit
 def test_raw_filter_drops_all_correct_even_when_shaped_rewards_differ():
     args = Namespace(reward_key=None)
     samples = [

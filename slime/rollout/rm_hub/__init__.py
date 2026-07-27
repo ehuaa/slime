@@ -15,6 +15,7 @@ from .gpqa import compute_gpqa_reward
 from .math_dapo_utils import compute_score as compute_score_dapo
 from .math_utils import extract_answer as extract_boxed_answer
 from .math_utils import grade_answer_verl
+from .zero2one import get_zero2one_rule_based_reward
 
 _shared_session: aiohttp.ClientSession | None = None
 
@@ -71,6 +72,12 @@ async def async_rm(args, sample: Sample, **kwargs):
         return await remote_rm(args, sample)
     elif rm_type == "deepscaler":
         return get_deepscaler_rule_based_reward(response, label)
+    elif rm_type == "zero2one":
+        return get_zero2one_rule_based_reward(
+            response,
+            label,
+            extract_last_number=bool(metadata.get("extract_last_number", False)),
+        )
     elif rm_type == "dapo":
         return compute_score_dapo(response, label)
     elif rm_type == "math":
