@@ -161,31 +161,25 @@ ROLLOUT_ARGS=(
    --apply-chat-template
    --rollout-shuffle
    --rm-type deepscaler
-   # DAPO Soft Overlong Punishment (added 2026-07-04 after a 27-step run showed runaway
-   # length: truncated samples score 0, so fully-truncated groups are zero-std and were
-   # DROPPED by the nonzero-std filter -- the longest generations never received negative
-   # feedback while long-correct ones were reinforced at full weight; response_len and
-   # truncation climbed monotonically and eval fell below step-0). custom_rm = deepscaler
-   # + linear length penalty over the last 16384 tokens before the cap (0 -> -1;
-   # truncated = -1). Long-but-finished samples now differ in reward inside a group =>
-   # such groups PASS the std filter and deliver the length-pressure gradient. Eval
-   # rewards are NOT shaped (is_eval metadata guard). Buffer: env DAPO_OVERLONG_BUFFER.
+   # Standard DAPO Soft Overlong Punishment: deepscaler 0/1 accuracy is stored as the raw
+   # filtering/metric signal, mapped to a -1/+1 training reward, then given a linear length
+   # penalty over the last 16000 tokens before the cap (0 -> -1). Dynamic sampling filters
+   # on raw accuracy, so shaping cannot make an all-correct/all-wrong group pass. Eval rewards
+   # remain pure 0/1 accuracy via the is_eval metadata guard. Buffer: env DAPO_OVERLONG_BUFFER.
    --custom-rm-path slime.rollout.rm_hub.dapo_overlong.custom_rm
    # ABSOLUTE endpoint, not a delta: train.py loops range(start_rollout_id, num_rollout).
    # Resuming at rollout_id 100, so 200 = another 100 steps (saves land at 119/139/159/179/199
    # per --save-interval 20). Raise this if you want to train further.
    --num-rollout 200
-   # DAPO-style dynamic sampling (validated 2026-07-03 on 16 GPUs): target 128 VALID groups
-   # per step (nonzero reward std; all-correct/all-wrong groups carry zero advantage = zero
-   # gradient and are dropped — unfiltered runs wasted 78% of samples). At 64 GPUs the os=512
-   # first wave is 4096 requests = 64/rank, the same per-rank load as the validated 16-GPU
-   # os=128 runs (KV peak ~0.6, zero retracts). Measured valid rate ~30% -> ~154 expected
-   # valid groups per wave >= 128, so one wave usually suffices. Aborted in-flight work is
-   # discarded (pure on-policy; NO --partial-rollout by choice).
+   # Standard DAPO dynamic sampling: keep 64 groups whose raw 0/1 accuracy is non-constant.
+   # Generate each 256-group wave to completion, then select valid groups in original prompt
+   # order. This avoids the short-response bias caused by accepting FIRST_COMPLETED groups.
+   # Soft-overlong shaping affects the training reward but not this correctness filter.
    --rollout-batch-size 64
    --n-samples-per-prompt 8
    --over-sampling-batch-size 256
-   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
+   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_raw_reward_nonzero_std
+   --dynamic-sampling-wait-all
    # 64000 fills the 65536 YaRN window: longest dapo prompt is 1468 tok, so 1468+64000=65468
    # <= 65536 (no sample truncated by context). cp4 splits the longest single sequence to
    # 65468/4 = 16367 tok/rank <= --max-tokens-per-gpu 16384, so peak activation is unchanged.
@@ -195,7 +189,7 @@ ROLLOUT_ARGS=(
    --rollout-max-context-len 65536
    --rollout-temperature 1
 
-   # 32 groups x 8 samples = 256 = GBS: exactly ONE on-policy update per rollout.
+   # 64 groups x 8 samples = 512 trajectories, split into two GBS-256 optimizer steps.
    --num-steps-per-rollout 2
    --balance-data
 )
@@ -258,6 +252,7 @@ GRPO_ARGS=(
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
+   --eps-clip-c 10.0
    # DAPO Token-Level PG Loss: default sample-level normalization averages the loss inside
    # each sample first, so a 64K-token negative sample contributes ~1/64000 gradient per
    # token while short positives hit at full weight -- long generations were rewarded at

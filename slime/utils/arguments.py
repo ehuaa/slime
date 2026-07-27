@@ -414,6 +414,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "You could use `slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std` as an example."
                 ),
             )
+            parser.add_argument(
+                "--dynamic-sampling-wait-all",
+                action="store_true",
+                default=False,
+                help=(
+                    "Wait for every prompt group in each over-sampling wave before filtering. "
+                    "Qualified groups are then selected in original prompt order, matching synchronous "
+                    "DAPO sampling and avoiding a short-response completion-order bias."
+                ),
+            )
 
             # partial rollout
             parser.add_argument(

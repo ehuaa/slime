@@ -14,11 +14,11 @@ length penalty that ramps linearly inside a buffer zone right below the response
     L_max - buffer < length  : penalty -(length - (L_max - buffer)) / buffer   (0 -> -1)
     truncated (>= L_max)     : penalty -1
 
-Consequences:
-  * finished-but-long samples now carry a graded negative signal — and because their
-    rewards differ inside a group, such groups pass the nonzero-std filter and actually
-    deliver the length-pressure gradient (they were previously dropped as all-1.0);
-  * truncated members of mixed groups fall from 0 to -1, doubling their disadvantage.
+The unshaped 0/1 accuracy is stored in ``sample.metadata["raw_reward"]`` for
+DAPO dynamic sampling and metrics. The training reward maps that accuracy to
+-1/+1 before adding the length penalty, matching the standard DAPO reward
+scale. Dynamic sampling must filter on ``raw_reward`` rather than this shaped
+training reward.
 
 EVAL SAFETY: eval scores must stay pure accuracy. Eval samples are tagged via the
 eval dataset config (scripts/eval-config-deepseek-v2.yaml sets
@@ -42,19 +42,25 @@ OVERLONG_BUFFER = int(os.environ.get("DAPO_OVERLONG_BUFFER", 16000))
 
 
 def _reward_one(args, sample: Sample, evaluation: bool) -> float:
-    base = float(get_deepscaler_rule_based_reward(sample.response, sample.label))
+    accuracy = float(get_deepscaler_rule_based_reward(sample.response, sample.label))
+    if accuracy not in (0.0, 1.0):
+        raise ValueError(f"DAPO accuracy reward must be binary, got {accuracy}")
 
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    sample.metadata = metadata
+    metadata["raw_reward"] = accuracy
     if evaluation or metadata.get("is_eval"):
-        return base
+        return accuracy
+
+    base_reward = 2.0 * accuracy - 1.0
 
     max_len = args.rollout_max_response_len
     threshold = max_len - OVERLONG_BUFFER
     length = sample.response_length or 0
     if length <= threshold:
-        return base
+        return base_reward
     penalty = -min(length - threshold, OVERLONG_BUFFER) / OVERLONG_BUFFER
-    return base + penalty
+    return base_reward + penalty
 
 
 async def custom_rm(args, sample, evaluation: bool = False, **kwargs):

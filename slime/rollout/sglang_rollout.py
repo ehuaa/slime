@@ -432,10 +432,21 @@ async def generate_rollout_async(
             samples = data_source(args.over_sampling_batch_size)
             state.submit_generate_tasks(samples)
 
-        # wait for the generation to finish
-        done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            group: list[Sample] = task.result()
+        # Standard DAPO filters a complete generation wave. Waiting for only
+        # the first completions and stopping as soon as the target is filled
+        # systematically favors shorter groups. Keep the legacy streaming
+        # behavior as the default, but allow recipes to opt into unbiased,
+        # deterministic wave-level selection.
+        wait_all = getattr(args, "dynamic_sampling_wait_all", False)
+        wait_mode = asyncio.ALL_COMPLETED if wait_all else asyncio.FIRST_COMPLETED
+        done, state.pendings = await asyncio.wait(state.pendings, return_when=wait_mode)
+        completed_groups = [task.result() for task in done]
+        if wait_all:
+            completed_groups.sort(
+                key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index
+            )
+
+        for group in completed_groups:
 
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
