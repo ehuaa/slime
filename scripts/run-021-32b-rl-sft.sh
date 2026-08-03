@@ -41,6 +41,9 @@
 #   num_layers_in_last_pipeline_stage=7     -> --decoder-last-pipeline-num-layers 7
 #   override_transformer_config.apply_rope_fusion=False -> --no-rope-fusion (in models/deepseek-v2.sh)
 #   rollout.tensor_model_parallel_size=4    -> --rollout-num-gpus-per-engine 4
+#   override_transformer_config.num_query_groups=32 -> a patched sibling HF config (see HF_CKPT):
+#     slime's bridge path has no override_transformer_config hook, and without this the model
+#     will not even build (TE: attention heads must be divisible by GQA groups)
 #
 # Deliberate deviations from the verl script (all documented inline below):
 #   * megatron.bridge instead of the dist checkpoint (slime's supported load path for this model)
@@ -160,10 +163,32 @@ source "${SLIME_DIR}/scripts/models/deepseek-v2.sh"
 # of --make-vocab-size-divisible-by x TP.
 MODEL_ARGS+=(--vocab-size 129280)
 
-# verl HF_MODEL_PATH. Its config.json has max_position_embeddings=32768 and
-# rope_scaling.factor=1.0, i.e. a plain 32k window -- matching verl's effective
-# max_model_len (vllm_async_server falls back to max_position_embeddings).
-HF_CKPT=${HF_CKPT:-/mnt/data/data/home/czh/RL/021-32b-rl/021-32b/epoch4_fixed}
+# verl HF_MODEL_PATH is .../021-32b/epoch4_fixed. Its config.json has
+# max_position_embeddings=32768 and rope_scaling.factor=1.0, i.e. a plain 32k window --
+# matching verl's effective max_model_len (vllm_async_server falls back to
+# max_position_embeddings). We point at a SIBLING dir instead: symlinks to the same weights
+# plus one corrected field.
+#
+# Why: that config declares num_key_value_heads=128 alongside num_attention_heads=32. It is
+# junk metadata (MLA has no GQA -- KV is the kv_lora_rank=512 latent), but megatron.bridge
+# copies it verbatim through the generic pair ("num_key_value_heads", "num_query_groups") in
+# models/conversion/model_bridge.py, and TransformerEngine then asserts
+#   AssertionError: The number of attention heads must be divisible by the number of GQA groups!
+# when instantiating MLASelfAttention (32 % 128 != 0).
+# verl papered over exactly this with its last two overrides:
+#   ++actor_rollout_ref.{actor,ref}.megatron.override_transformer_config.num_query_groups=32
+# slime's bridge path has no equivalent hook (model_provider.py only forwards a fixed list of
+# provider attrs), so the fix belongs in the config. 32 is also what the working 021A
+# checkpoint declares. Same trick as dsv2-021A-cotgeo-yarn2-65536, which is a symlink sibling
+# carrying a patched rope_scaling. Rebuild it with:
+#   SRC=/mnt/data/data/home/czh/RL/021-32b-rl/021-32b/epoch4_fixed
+#   DST=/mnt/data/data/home/czh/RL/021-32b-epoch4-fixed-nqg32
+#   mkdir -p "$DST"; for f in "$SRC"/*; do b=$(basename "$f"); [ "$b" = config.json ] && continue
+#     [ -d "$f" ] && continue; ln -sfn "$f" "$DST/$b"; done
+#   python3 -c 'import json,sys;c=json.load(open(sys.argv[1]));c["num_key_value_heads"]=32;
+#     json.dump(c,open(sys.argv[2],"w"),indent=2)' "$SRC/config.json" "$DST/config.json"
+# Set HF_CKPT back to the raw epoch4_fixed only if the bridge ever learns to ignore the field.
+HF_CKPT=${HF_CKPT:-/mnt/data/data/home/czh/RL/021-32b-epoch4-fixed-nqg32}
 SAVE_DIR=${SAVE_DIR:-/mnt/data/data/home/czh/RL/021-32b_slime_grpo}
 
 DATASET_PATH=${DATASET_PATH:-/mnt/data/data/home/czh/RL/021-32b-rl/021-32b/qwen3-4b-instruct-2507}
