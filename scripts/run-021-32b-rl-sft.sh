@@ -342,15 +342,21 @@ PERF_ARGS=(
    --recompute-num-layers 1
 
    --use-dynamic-batch-size
-   # verl actor_ppo_max_token_len = (2048 + 32768) x 1 = 34816. With cp1 a single long sequence
-   # cannot be split across ranks, so this must stay >= the longest packed sequence or the
-   # microbatch packer has nothing valid to do. If the last pipeline stage OOMs on the logits,
-   # the escape hatches are (in order): ACTOR_CP=2 (halves tokens/rank, needs the expert mapping
-   # re-checked), then lowering this value, then --sglang-mem-fraction-static.
-   # NOTE for 16 GPUs: that config is genuinely tighter than 32 -- ep4 doubles per-rank expert
-   # state vs ep8, on top of this 34816 already being 2.1x the 16384 the old 021A 16-GPU runs
-   # used. Expect to reach for MAX_TOKENS_PER_GPU first if it OOMs there.
-   --max-tokens-per-gpu ${MAX_TOKENS_PER_GPU:-34816}
+   # verl's actor_ppo_max_token_len is (2048 + 32768) x 1 = 34816; we run 16384 instead, which
+   # is what the 021A runs on this hardware used.
+   # What lowering it does, and does NOT do, under cp1: first_fit_pack puts an oversized sample
+   # ALONE in its own bin (slime/utils/seqlen_balancing.py:180) instead of erroring or dropping
+   # it, so a cap below the longest sequence never breaks the packer -- but it also cannot
+   # shrink the worst case, because with cp1 one sequence cannot be split across ranks. On a
+   # synthetic 64-sample step the largest bin stayed 34000 tokens at BOTH 34816 and 16384;
+   # only the microbatch count moved, 34 -> 47.
+   # So this caps the PACKED combinations (no more two 16k samples sharing one 32k bin) and
+   # hands the pipeline more, smaller microbatches (smaller bubble); it does not lower the
+   # single-longest-sequence peak that drives last-stage logits memory. To move THAT, use
+   # ACTOR_CP=2 (splits a sequence across ranks -- re-check the expert mapping) or a smaller
+   # --rollout-max-response-len. --sglang-mem-fraction-static is the other lever.
+   # 16 GPUs is tighter than 32 regardless: ep4 doubles per-rank expert state vs ep8.
+   --max-tokens-per-gpu ${MAX_TOKENS_PER_GPU:-16384}
 )
 
 GRPO_ARGS=(
