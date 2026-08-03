@@ -29,11 +29,20 @@ def _numbers_equal(prediction: str, ground_truth: str | int | float) -> bool:
 
 def get_zero2one_rule_based_reward(
     response: str,
-    label: str | int | float,
+    label: str | int | float | dict,
     *,
     extract_last_number: bool = False,
 ) -> int:
-    """Return 1 when the extracted numeric answer equals ``label``, else 0."""
+    """Return 1 when the extracted numeric answer equals ``label``, else 0.
+
+    ``label`` may be the verl ``reward_model`` struct itself
+    (``{"ground_truth": ..., "style": "rule"}``) as it comes straight out of the
+    zero2one parquet files; the ground truth is unwrapped in that case, matching
+    verl's own dispatcher (verl/utils/reward_score/__init__.py).
+    """
+    if isinstance(label, dict):
+        label = label.get("ground_truth")
+
     if label is None or str(label).strip() == "":
         return 0
 

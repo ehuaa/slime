@@ -55,6 +55,15 @@ def test_invalid_or_empty_answer_returns_zero():
 
 
 @pytest.mark.unit
+def test_reward_model_struct_label_is_unwrapped():
+    # `--label-key reward_model` hands the whole verl struct through as the label.
+    assert get_zero2one_rule_based_reward(r"\\boxed{45}", {"ground_truth": 45, "style": "rule"}) == 1
+    assert get_zero2one_rule_based_reward(r"\\boxed{33}", {"ground_truth": "33", "style": "rule"}) == 1
+    assert get_zero2one_rule_based_reward(r"\\boxed{34}", {"ground_truth": "33", "style": "rule"}) == 0
+    assert get_zero2one_rule_based_reward(r"\\boxed{34}", {"style": "rule"}) == 0
+
+
+@pytest.mark.unit
 def test_rm_type_dispatch_and_metadata_fallback():
     args = Namespace(custom_rm_path=None, rm_type="zero2one")
     sample = Sample(

@@ -1,0 +1,43 @@
+# Eval dataset config for run-021-32b-rl-sft.sh.
+#
+# Replicates verl's `data.val_files=['zero2one_aime_2024_str.parquet','zero2one_aime_2025_str.parquet']`
+# plus its `rollout.val_kwargs` block (do_sample=True, n=8, temperature=0.6, top_p=0.95, top_k=-1).
+# Both files are read straight out of the verl dataset dir -- slime's Dataset reads .parquet
+# natively, and the `prompt` column is already a chat-message list, so --apply-chat-template
+# renders it exactly like verl's RLHFDataset does.
+#
+# rm_type is pinned per dataset so eval stays on the zero2one 0/1 scorer regardless of what
+# the run's default --rm-type is. label_key follows the training config (`reward_model`, the
+# {ground_truth, style} struct); zero2one unwraps it, same as verl's dispatcher.
+eval:
+  datasets:
+    - name: aime24
+      rm_type: zero2one
+      path: ${EVAL_DATA_AIME24}
+      input_key: prompt
+      label_key: reward_model
+      n_samples_per_eval_prompt: 8
+      temperature: 0.6
+      top_p: 0.95
+      top_k: -1
+      max_response_len: ${MAX_RESPONSE_LENGTH}
+      # Only matters when the run is launched with ENABLE_OVERLONGBUFFER=True: --custom-rm-path
+      # short-circuits reward dispatch for eval too, and this tag is what makes dapo_overlong
+      # skip the -1/+1 remap + length penalty so eval stays pure 0/1 accuracy. Inert otherwise.
+      metadata_overrides:
+        is_eval: true
+    - name: aime25
+      rm_type: zero2one
+      path: ${EVAL_DATA_AIME25}
+      input_key: prompt
+      label_key: reward_model
+      n_samples_per_eval_prompt: 8
+      temperature: 0.6
+      top_p: 0.95
+      top_k: -1
+      max_response_len: ${MAX_RESPONSE_LENGTH}
+      # Only matters when the run is launched with ENABLE_OVERLONGBUFFER=True: --custom-rm-path
+      # short-circuits reward dispatch for eval too, and this tag is what makes dapo_overlong
+      # skip the -1/+1 remap + length penalty so eval stays pure 0/1 accuracy. Inert otherwise.
+      metadata_overrides:
+        is_eval: true
