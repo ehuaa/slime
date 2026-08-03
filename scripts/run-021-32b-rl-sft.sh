@@ -288,13 +288,40 @@ EVAL_ARGS=(
 # verl actor megatron: TP4 / PP4 / EP8 / ETP1 / CP1 on 32 GPUs.
 #   non-expert: tp4 x pp4 x cp1 x dp2  = 32
 #   expert:     etp1 x ep8 x pp4 x edp1 = 32
-# NOTE: these sizes are tied to a 32-GPU (4-node) cluster. On 16 GPUs the expert mapping
-# (etp1 x ep8 x pp4) already needs 32 ranks and will fail -- drop EP to 4 (or PP to 2) first.
+# Megatron requires TOTAL_GPUS to be divisible by BOTH tp*cp*pp and etp*ep*pp
+# (parallel_state.initialize_model_parallel). The EXPERT constraint is the binding one here:
+# ep8 x pp4 already needs 32 ranks, so verl's mapping cannot run on 16 GPUs -- it dies with
+#   RuntimeError: world_size (16) is not divisible by
+#                 expert_tensor_model_pipeline_parallel size (32)
+# EP therefore scales with the cluster (edp stays 1, i.e. no expert replication):
+#   32 GPUs (4 nodes) -> ep8   verl's own value
+#   16 GPUs (2 nodes) -> ep4   pp4 and the 11/11/11/7 split stay exactly as verl, and the EP
+#                              group is still intra-node ([0-3][4-7] on node 0, [8-11][12-15]
+#                              on node 1). Per-rank expert state is 40/pp x 80/ep = 200
+#                              expert-FFNs either way -- the same figure the 021A 16-GPU runs
+#                              already fit -- so halving the cluster costs throughput, not fit.
+# Above 32 GPUs this formula pushes EP past 8 and the all-to-all starts spanning nodes; raise
+# ACTOR_PP instead, or accept edp>1 (which replicates expert params/grads -- see the ep16 note
+# in run-deepseek-v2-multinode.sh for how that went).
 ACTOR_TP=${ACTOR_TP:-4}
 ACTOR_PP=${ACTOR_PP:-4}
 ACTOR_CP=${ACTOR_CP:-1}
-ACTOR_EP=${ACTOR_EP:-8}
 ACTOR_ETP=${ACTOR_ETP:-1}
+ACTOR_EP=${ACTOR_EP:-$((TOTAL_GPUS / (ACTOR_ETP * ACTOR_PP)))}
+
+# Preflight: check both divisibility rules HERE rather than 10+ minutes later inside
+# initialize_model_parallel, after ray, sglang and the bridge have all spun up.
+MP=$((ACTOR_TP * ACTOR_CP * ACTOR_PP))
+EMP=$((ACTOR_ETP * ACTOR_EP * ACTOR_PP))
+if [ "${MP}" -eq 0 ] || [ "${EMP}" -eq 0 ] || [ $((TOTAL_GPUS % MP)) -ne 0 ] || [ $((TOTAL_GPUS % EMP)) -ne 0 ]; then
+   echo "FATAL: parallel mapping does not fit ${TOTAL_GPUS} GPUs (NNODES=${NNODES})."
+   echo "  non-expert  tp${ACTOR_TP} x cp${ACTOR_CP} x pp${ACTOR_PP} = ${MP}   must divide ${TOTAL_GPUS}"
+   echo "  expert      etp${ACTOR_ETP} x ep${ACTOR_EP} x pp${ACTOR_PP} = ${EMP}   must divide ${TOTAL_GPUS}"
+   echo "  Fix: ACTOR_EP=$((TOTAL_GPUS / (ACTOR_ETP * ACTOR_PP))) (gives edp=1), or lower ACTOR_PP / ACTOR_CP."
+   exit 1
+fi
+echo "parallel: world=${TOTAL_GPUS} tp${ACTOR_TP} cp${ACTOR_CP} pp${ACTOR_PP} ep${ACTOR_EP} etp${ACTOR_ETP}" \
+     "-> dp=$((TOTAL_GPUS / MP)) edp=$((TOTAL_GPUS / EMP))"
 
 PERF_ARGS=(
    --tensor-model-parallel-size "${ACTOR_TP}"
@@ -320,6 +347,9 @@ PERF_ARGS=(
    # microbatch packer has nothing valid to do. If the last pipeline stage OOMs on the logits,
    # the escape hatches are (in order): ACTOR_CP=2 (halves tokens/rank, needs the expert mapping
    # re-checked), then lowering this value, then --sglang-mem-fraction-static.
+   # NOTE for 16 GPUs: that config is genuinely tighter than 32 -- ep4 doubles per-rank expert
+   # state vs ep8, on top of this 34816 already being 2.1x the 16384 the old 021A 16-GPU runs
+   # used. Expect to reach for MAX_TOKENS_PER_GPU first if it OOMs there.
    --max-tokens-per-gpu ${MAX_TOKENS_PER_GPU:-34816}
 )
 
