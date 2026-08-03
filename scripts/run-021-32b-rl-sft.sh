@@ -14,7 +14,9 @@
 #   reward_model.ground_truth               -> --label-key reward_model (struct unwrapped by zero2one)
 #   data.max_prompt_length=2048             -> --rollout-max-prompt-len 2048
 #     + data.filter_overlong_prompts=True     (slime's Dataset drops longer prompts at load)
-#   data.max_response_length=32768          -> --rollout-max-response-len 32768
+#   data.max_response_length=32768          -> --rollout-max-response-len 30720 (NOT 32768:
+#     verl clamps per request to max_model_len - prompt_len, slime does not -- see
+#     MAX_RESPONSE_LENGTH below, where the prompt budget is subtracted instead)
 #   data.train_batch_size=128               -> --rollout-batch-size 128
 #   rollout.n=8                             -> --n-samples-per-prompt 8
 #   actor.ppo_mini_batch_size=128           -> --num-steps-per-rollout 1 (128*8=1024 = one GBS)
@@ -196,8 +198,23 @@ PROMPT_DATA=${PROMPT_DATA:-${DATASET_PATH}/zero2one_amt_math17k_d.parquet}
 EVAL_DATA_AIME24=${EVAL_DATA_AIME24:-${DATASET_PATH}/zero2one_aime_2024_str.parquet}
 EVAL_DATA_AIME25=${EVAL_DATA_AIME25:-${DATASET_PATH}/zero2one_aime_2025_str.parquet}
 
+# The model window. verl never sets rollout.max_model_len, so vllm_async_server falls back to
+# the HF max_position_embeddings -- 32768 for this checkpoint.
+MAX_CONTEXT_LENGTH=${MAX_CONTEXT_LENGTH:-32768}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-32768}
+# verl's data.max_response_length=32768 is an UPPER BOUND that gets clamped per request:
+# vllm_async_server.py:520 computes max_possible_tokens = max_model_len - len(prompt_ids).
+# slime does NOT clamp -- sglang_rollout.py:101 passes max_new_tokens=rollout_max_response_len
+# verbatim -- so copying 32768 across made every single request overflow the window:
+#   400 Bad Request: "Requested token count exceeds the model's maximum context length of
+#   32768 tokens. You requested a total of 32967 tokens: 199 from the input messages and
+#   32768 for the completion."
+# Budget the prompt out of the response instead. --rollout-max-prompt-len already drops any
+# prompt above MAX_PROMPT_LENGTH at dataset load, so prompt + response <= the window always.
+# Cost vs verl: a short prompt gets 30720 completion tokens here instead of ~32570. Measured
+# on 2000 training prompts, mean is 144 tokens and max 1312, so this is ~1.7k of headroom we
+# decline to use -- irrelevant for generations that would be truncated at that length anyway.
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-$((MAX_CONTEXT_LENGTH - MAX_PROMPT_LENGTH))}
 
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CKPT}"
@@ -241,7 +258,7 @@ ROLLOUT_ARGS=(
    # The engine's own 32k window is what actually caps prompt+response, exactly as in verl
    # (max_possible_tokens = max_model_len - len(prompt_ids)). Longest observed prompt is
    # ~1.3k tokens, so responses effectively cap at ~31.5k before the window bites.
-   --rollout-max-context-len 32768
+   --rollout-max-context-len "${MAX_CONTEXT_LENGTH}"
    --rollout-temperature 1
    --rollout-top-p 0.999
    --rollout-top-k -1
@@ -306,7 +323,7 @@ EVAL_ARGS=(
    # verl trainer.test_freq=2. val_before_train=False is slime's default (no eval at rollout 0).
    --eval-interval 2
    --eval-config "${EVAL_CONFIG_RENDERED}"
-   --eval-max-context-len 32768
+   --eval-max-context-len "${MAX_CONTEXT_LENGTH}"
    --eval-max-prompt-len "${MAX_PROMPT_LENGTH}"
 )
 
