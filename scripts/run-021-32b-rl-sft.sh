@@ -337,17 +337,31 @@ EVAL_ARGS=(
 #                 expert_tensor_model_pipeline_parallel size (32)
 # EP therefore scales with the cluster (edp stays 1, i.e. no expert replication):
 #   32 GPUs (4 nodes) -> ep8   verl's own value
-#   16 GPUs (2 nodes) -> ep4   pp4 and the 11/11/11/7 split stay exactly as verl, and the EP
-#                              group is still intra-node ([0-3][4-7] on node 0, [8-11][12-15]
-#                              on node 1). Per-rank expert state is 40/pp x 80/ep = 200
-#                              expert-FFNs either way -- the same figure the 021A 16-GPU runs
-#                              already fit -- so halving the cluster costs throughput, not fit.
 # Above 32 GPUs this formula pushes EP past 8 and the all-to-all starts spanning nodes; raise
 # ACTOR_PP instead, or accept edp>1 (which replicates expert params/grads -- see the ep16 note
 # in run-deepseek-v2-multinode.sh for how that went).
+#
+# WHY CP2 (deviation from verl's cp1) -- this is the whole reason the mapping below is not
+# tp4/pp4/cp1. The training peak is driven by the SINGLE LONGEST sequence, not by the token
+# budget: first_fit_pack puts an oversized sample alone in its own bin (seqlen_balancing.py:
+# 180-198) and cp1 cannot split one sequence across ranks. With a 32768-token window that
+# makes a 32768-token microbatch unavoidable, and an OOM-snapshot of the cp1 run measured
+# ~44.6 GiB of transient activation for it (MoE 26.98 + attention 17.64) on top of ~11.6 GiB
+# of resident grad/param buffer -- i.e. right at the 79 GiB wall, which is exactly where the
+# 2-node run died at step 107.
+# The packer's bin cap is max_tokens_per_gpu * cp_size (dp_schedule.py:105), so cp2 raises it
+# to 16384*2 = 32768: a full-window sample now FITS a bin instead of overflowing it, and CP
+# additionally splits that sequence over 2 ranks, halving per-rank activation to ~22 GiB.
+#   16 GPUs (2 nodes): tp4 x cp2 x pp2 = 16 (dp1);  etp1 x ep8 x pp2 = 16 (edp1)
+#     -> ep8 is verl's own value. (Whether that 8-rank EP group lands intra-node depends on
+#        Megatron's rank ordering; not verified here, so treat all-to-all cost as unknown.)
+#   32 GPUs (4 nodes): tp4 x cp2 x pp2 = 16 (dp2);  etp1 x ep16 x pp2 = 32 (edp1)
+#     -> note EP auto-derives to 16 there, past the intra-node point flagged above.
+# If this still OOMs, the next step is cp4/pp1/ep16 (bin cap 65536, ~11 GiB per rank) -- but
+# that layout must also DROP --decoder-last-pipeline-num-layers, which is meaningless at pp1.
 ACTOR_TP=${ACTOR_TP:-4}
-ACTOR_PP=${ACTOR_PP:-4}
-ACTOR_CP=${ACTOR_CP:-1}
+ACTOR_PP=${ACTOR_PP:-2}
+ACTOR_CP=${ACTOR_CP:-2}
 ACTOR_ETP=${ACTOR_ETP:-1}
 ACTOR_EP=${ACTOR_EP:-$((TOTAL_GPUS / (ACTOR_ETP * ACTOR_PP)))}
 
@@ -365,6 +379,27 @@ fi
 echo "parallel: world=${TOTAL_GPUS} tp${ACTOR_TP} cp${ACTOR_CP} pp${ACTOR_PP} ep${ACTOR_EP} etp${ACTOR_ETP}" \
      "-> dp=$((TOTAL_GPUS / MP)) edp=$((TOTAL_GPUS / EMP))"
 
+# EP must divide the expert count, or initialize_model_parallel dies late with
+# "Number of experts should be a multiple of expert model parallel_size".
+NUM_EXPERTS=${NUM_EXPERTS:-80}
+if [ $((NUM_EXPERTS % ACTOR_EP)) -ne 0 ]; then
+   echo "FATAL: ACTOR_EP=${ACTOR_EP} does not divide --num-experts ${NUM_EXPERTS}."
+   exit 1
+fi
+
+# The packer's bin cap is max_tokens_per_gpu * cp_size (dp_schedule.py:105). If it drops below
+# the context window, a full-window sample becomes an oversized single-sample bin again and the
+# training peak goes back to what OOMed at cp1 -- silently, since the packer does not error.
+MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-16384}
+BIN_CAP=$((MAX_TOKENS_PER_GPU * ACTOR_CP))
+if [ "${BIN_CAP}" -lt "${MAX_CONTEXT_LENGTH}" ]; then
+   echo "FATAL: bin cap ${BIN_CAP} (= max_tokens_per_gpu ${MAX_TOKENS_PER_GPU} x cp ${ACTOR_CP})"
+   echo "  is below MAX_CONTEXT_LENGTH ${MAX_CONTEXT_LENGTH}; a full-window sample would form an"
+   echo "  oversized single-sample microbatch. Raise ACTOR_CP or MAX_TOKENS_PER_GPU."
+   exit 1
+fi
+echo "packer bin cap = ${MAX_TOKENS_PER_GPU} x cp${ACTOR_CP} = ${BIN_CAP} >= window ${MAX_CONTEXT_LENGTH} OK"
+
 PERF_ARGS=(
    --tensor-model-parallel-size "${ACTOR_TP}"
    --sequence-parallel
@@ -372,9 +407,7 @@ PERF_ARGS=(
    --context-parallel-size "${ACTOR_CP}"
    --expert-model-parallel-size "${ACTOR_EP}"
    --expert-tensor-parallel-size "${ACTOR_ETP}"
-   # verl override_transformer_config.num_layers_in_last_pipeline_stage=7: 40 layers over pp4
-   # as 11/11/11/7, so the last stage (which also carries the LM head + loss) stays lighter.
-   --decoder-last-pipeline-num-layers 7
+   # (--decoder-last-pipeline-num-layers is appended after this array; it is pp4-specific.)
 
    # verl: recompute_granularity=full, recompute_method=block, recompute_num_layers=40.
    # uniform/1 recomputes every layer too (identical coverage) and is the form validated on
@@ -386,20 +419,30 @@ PERF_ARGS=(
    --use-dynamic-batch-size
    # verl's actor_ppo_max_token_len is (2048 + 32768) x 1 = 34816; we run 16384 instead, which
    # is what the 021A runs on this hardware used.
-   # What lowering it does, and does NOT do, under cp1: first_fit_pack puts an oversized sample
-   # ALONE in its own bin (slime/utils/seqlen_balancing.py:180) instead of erroring or dropping
-   # it, so a cap below the longest sequence never breaks the packer -- but it also cannot
-   # shrink the worst case, because with cp1 one sequence cannot be split across ranks. On a
-   # synthetic 64-sample step the largest bin stayed 34000 tokens at BOTH 34816 and 16384;
-   # only the microbatch count moved, 34 -> 47.
-   # So this caps the PACKED combinations (no more two 16k samples sharing one 32k bin) and
-   # hands the pipeline more, smaller microbatches (smaller bubble); it does not lower the
-   # single-longest-sequence peak that drives last-stage logits memory. To move THAT, use
-   # ACTOR_CP=2 (splits a sequence across ranks -- re-check the expert mapping) or a smaller
-   # --rollout-max-response-len. --sglang-mem-fraction-static is the other lever.
-   # 16 GPUs is tighter than 32 regardless: ep4 doubles per-rank expert state vs ep8.
-   --max-tokens-per-gpu ${MAX_TOKENS_PER_GPU:-16384}
+   # This value is load-bearing ONLY through the packer's bin cap, which is
+   # max_tokens_per_gpu * cp_size (dp_schedule.py:105). The pairing that matters:
+   #   16384 * cp2 = 32768 >= the full context window, so NO sample is ever "oversized" and
+   #   every bin is a genuine multi-sample pack. Under cp1 the same 16384 could not do this:
+   #   first_fit_pack drops an oversized sample into a bin of its own (seqlen_balancing.py:
+   #   180-198), so the worst-case microbatch stayed at the full 32768 no matter how low the
+   #   cap went -- lowering it only moved the microbatch COUNT (34 -> 47 on a synthetic step).
+   # If you change ACTOR_CP, keep max_tokens_per_gpu * ACTOR_CP >= MAX_CONTEXT_LENGTH.
+   # NOTE: an OOM snapshot of the cp1 run attributed the peak to MoE (26.98 GiB) and attention
+   # (17.64 GiB); logits/loss measured ~0, so the last pipeline stage is NOT the hot spot here.
+   --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
 )
+
+# verl override_transformer_config.num_layers_in_last_pipeline_stage=7: 40 layers over pp4 as
+# 11/11/11/7, so the last stage (which also carries the LM head + loss) stays lighter. That
+# split is pp4-specific: at pp2 the same flag would mean 33/7, piling 26 extra layers onto
+# stage 0 -- and stage 0 is the memory-critical one (the step-107 OOM landed on rank3, a
+# stage-0 rank). At pp2 we therefore take Megatron's even 20/20; at pp1 the flag is undefined.
+if [ "${ACTOR_PP}" = "4" ]; then
+   PERF_ARGS+=(--decoder-last-pipeline-num-layers 7)
+   echo "pp4 -> layer split 11/11/11/7 (verl parity)"
+else
+   echo "pp${ACTOR_PP} -> even layer split (decoder-last-pipeline-num-layers not applied)"
+fi
 
 GRPO_ARGS=(
    --advantage-estimator grpo
@@ -563,7 +606,9 @@ PROMPT_DATA=${PROMPT_DATA}
 EVAL=${EVAL_DATA_AIME24} , ${EVAL_DATA_AIME25}
 prompt/response=${MAX_PROMPT_LENGTH}/${MAX_RESPONSE_LENGTH}  bs=128 x n=8
 TP${ACTOR_TP} PP${ACTOR_PP} EP${ACTOR_EP} ETP${ACTOR_ETP} CP${ACTOR_CP}  gen TP${INFER_TP}
-SAVE_DIR=${SAVE_DIR}  save-interval=10  eval-interval=2  num-rollout=135
+packer bin cap=${MAX_TOKENS_PER_GPU} x cp${ACTOR_CP}=${BIN_CAP}  (window ${MAX_CONTEXT_LENGTH})
+LOAD=${HF_CKPT}  (fresh run from the SFT init)
+SAVE_DIR=${SAVE_DIR}  save-interval=100  eval-interval=2  num-rollout=200
 ====================================
 CFG
 
