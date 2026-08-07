@@ -131,6 +131,27 @@ fi
 grep -q _prepare_mla_core_attention_value "${MEGATRON_PATH}/megatron/core/transformer/multi_latent_attention.py" \
    && echo "megatron.patch OK on $(hostname)" || { echo "FATAL: megatron.patch NOT applied on $(hostname)"; exit 1; }
 
+# ---------------- repair _batched_p2p_ops (must run on EVERY node, every time) ----------------
+# slime commit fef503e2 (2025-07-26, direct to main, no PR) had megatron.patch rewrite
+# _batched_p2p_ops to build its four P2POp objects WITHOUT the `group` argument, so all
+# pipeline p2p ran on the default 16-rank world communicator instead of the 2-rank PP group.
+# That deadlocks the first train step whenever PP > 1 and CP > 1 (measured 3x on 2 nodes:
+# cp4/pp1 and cp2/pp1 are fine, cp2/pp2 hangs with one stage-0 rank frozen in send_forward ->
+# _batched_p2p_ops -> batch_isend_irecv). The hunk is gone from our megatron.patch now, BUT
+# the container image bakes the old edit straight into /root/Megatron-LM (it shows up as a
+# STAGED modification, i.e. it predates anything this script does), and removing a hunk from a
+# patch cannot undo an edit that is already on disk. So repair it here rather than relying on
+# the patch -- unconditional and idempotent, because a fresh node always starts out broken.
+P2P_FILE="${MEGATRON_PATH}/megatron/core/pipeline_parallel/p2p_communication.py"
+if [ "$(grep -c 'pipeline_rank, group,$' "${P2P_FILE}")" -ne 4 ]; then
+   sed -i -E 's/^( +torch\.distributed\.(isend|irecv), tensor_(send|recv)_(prev|next), (prev|next)_pipeline_rank),$/\1, group,/' "${P2P_FILE}"
+   echo "repaired _batched_p2p_ops group arg on $(hostname)"
+fi
+[ "$(grep -c 'pipeline_rank, group,$' "${P2P_FILE}")" -eq 4 ] \
+   || { echo "FATAL: _batched_p2p_ops still drops the process group on $(hostname);"; \
+        echo "  PP>1 with CP>1 would deadlock. Check ${P2P_FILE}"; exit 1; }
+echo "_batched_p2p_ops passes group OK on $(hostname)"
+
 # ---------------- worker: join the Ray cluster and stay alive ----------------
 if [ "${ROLE}" = "worker" ]; then
    until (exec 3<>"/dev/tcp/${MASTER_ADDR}/6379") 2>/dev/null; do echo "waiting for ray head..."; sleep 5; done
