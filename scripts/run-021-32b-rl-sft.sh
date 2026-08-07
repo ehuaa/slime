@@ -341,27 +341,40 @@ EVAL_ARGS=(
 # ACTOR_PP instead, or accept edp>1 (which replicates expert params/grads -- see the ep16 note
 # in run-deepseek-v2-multinode.sh for how that went).
 #
-# WHY CP2 (deviation from verl's cp1) -- this is the whole reason the mapping below is not
-# tp4/pp4/cp1. The training peak is driven by the SINGLE LONGEST sequence, not by the token
-# budget: first_fit_pack puts an oversized sample alone in its own bin (seqlen_balancing.py:
-# 180-198) and cp1 cannot split one sequence across ranks. With a 32768-token window that
+# WHY CP4 / PP1 (deviation from verl's tp4/pp4/cp1) -- two separate reasons.
+#
+# (a) Why CP at all. The training peak is driven by the SINGLE LONGEST sequence, not by the
+# token budget: first_fit_pack puts an oversized sample alone in its own bin (seqlen_balancing
+# .py:180-198) and cp1 cannot split one sequence across ranks. With a 32768-token window that
 # makes a 32768-token microbatch unavoidable, and an OOM-snapshot of the cp1 run measured
 # ~44.6 GiB of transient activation for it (MoE 26.98 + attention 17.64) on top of ~11.6 GiB
 # of resident grad/param buffer -- i.e. right at the 79 GiB wall, which is exactly where the
-# 2-node run died at step 107.
-# The packer's bin cap is max_tokens_per_gpu * cp_size (dp_schedule.py:105), so cp2 raises it
-# to 16384*2 = 32768: a full-window sample now FITS a bin instead of overflowing it, and CP
-# additionally splits that sequence over 2 ranks, halving per-rank activation to ~22 GiB.
-#   16 GPUs (2 nodes): tp4 x cp2 x pp2 = 16 (dp1);  etp1 x ep8 x pp2 = 16 (edp1)
-#     -> ep8 is verl's own value. (Whether that 8-rank EP group lands intra-node depends on
-#        Megatron's rank ordering; not verified here, so treat all-to-all cost as unknown.)
-#   32 GPUs (4 nodes): tp4 x cp2 x pp2 = 16 (dp2);  etp1 x ep16 x pp2 = 32 (edp1)
-#     -> note EP auto-derives to 16 there, past the intra-node point flagged above.
-# If this still OOMs, the next step is cp4/pp1/ep16 (bin cap 65536, ~11 GiB per rank) -- but
-# that layout must also DROP --decoder-last-pipeline-num-layers, which is meaningless at pp1.
+# 2-node run died at step 107. The packer's bin cap is max_tokens_per_gpu * cp_size
+# (dp_schedule.py:105), so cp4 raises it to 16384*4 = 65536, well clear of the window, and CP
+# splits that sequence over 4 ranks.
+#
+# (b) Why PP1 rather than PP2. tp4/cp2/pp2/ep8 was tried on 2 nodes on 2026-08-07 and
+# DEADLOCKED ~13 s into the first train step, before any microbatch finished (rollout itself
+# was fine: raw_reward 0.408, response_lengths 2487, truncated 0.0 -- so nothing to do with
+# long sequences). py-spy showed the 8 stage-1 ranks split three ways: cp_rank0 ranks inside
+# TE's CP ring (flash_attn_p2p_communicate -> isend), cp_rank1 ranks back at the MLA TP
+# allgather, one rank still in PP recv_forward. NCCL confirmed it: three nranks=2 comms
+# entered ncclCommInitRankConfig and only one reached Init COMPLETE. The NCCL watchdog killed
+# all 16 ranks 600 s later (_REDUCE_SCATTER_BASE NumelIn=33554432 = 16384 tok x 2048 hidden).
+# Not memory, not data sharding (actor.py:93 passes dp_size with_context_parallel=False), not
+# PP shapes (arguments.py:78 sets variable_seq_lengths=True) -- PP and CP together is simply
+# an unvalidated combination in this stack (TE 2.10 CP ring + MLA + THD packing).
+# tp4/cp4/pp1/ep16 is the layout run-deepseek-v2-multinode.sh (same DeepseekV2 MLA arch, same
+# megatron.patch V-pad, same --attention-backend flash) has actually run on 2 nodes at
+# --rollout-max-response-len 64000. Prefer the validated shape over the clever one.
+#
+#   16 GPUs (2 nodes): tp4 x cp4 x pp1 = 16 (dp1);  etp1 x ep16 x pp1 = 16 (edp1)
+#   32 GPUs (4 nodes): the EP formula below derives ep32, which does NOT divide 80 experts --
+#     the preflight will stop you. Pin ACTOR_EP=16 (accepting edp=2, i.e. expert replication)
+#     or raise ACTOR_CP; do not silently reintroduce PP to make the arithmetic work.
 ACTOR_TP=${ACTOR_TP:-4}
-ACTOR_PP=${ACTOR_PP:-2}
-ACTOR_CP=${ACTOR_CP:-2}
+ACTOR_PP=${ACTOR_PP:-1}
+ACTOR_CP=${ACTOR_CP:-4}
 ACTOR_ETP=${ACTOR_ETP:-1}
 ACTOR_EP=${ACTOR_EP:-$((TOTAL_GPUS / (ACTOR_ETP * ACTOR_PP)))}
 
@@ -421,7 +434,7 @@ PERF_ARGS=(
    # is what the 021A runs on this hardware used.
    # This value is load-bearing ONLY through the packer's bin cap, which is
    # max_tokens_per_gpu * cp_size (dp_schedule.py:105). The pairing that matters:
-   #   16384 * cp2 = 32768 >= the full context window, so NO sample is ever "oversized" and
+   #   16384 * cp4 = 65536 >= the full context window, so NO sample is ever "oversized" and
    #   every bin is a genuine multi-sample pack. Under cp1 the same 16384 could not do this:
    #   first_fit_pack drops an oversized sample into a bin of its own (seqlen_balancing.py:
    #   180-198), so the worst-case microbatch stayed at the full 32768 no matter how low the
@@ -436,7 +449,8 @@ PERF_ARGS=(
 # 11/11/11/7, so the last stage (which also carries the LM head + loss) stays lighter. That
 # split is pp4-specific: at pp2 the same flag would mean 33/7, piling 26 extra layers onto
 # stage 0 -- and stage 0 is the memory-critical one (the step-107 OOM landed on rank3, a
-# stage-0 rank). At pp2 we therefore take Megatron's even 20/20; at pp1 the flag is undefined.
+# stage-0 rank). We now run pp1, where the flag is undefined and all 40 layers sit on the one
+# stage; the guard below keeps it off unless someone deliberately goes back to pp4.
 if [ "${ACTOR_PP}" = "4" ]; then
    PERF_ARGS+=(--decoder-last-pipeline-num-layers 7)
    echo "pp4 -> layer split 11/11/11/7 (verl parity)"
