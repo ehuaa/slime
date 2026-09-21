@@ -1,17 +1,54 @@
 diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
-index c74f7666a9972ba7ee5b0c94c805189e640fbbda..107c6eadf6a33e19f4f34d3668c22856ea221e1a 100644
+index ac38b46..5e6ce59 100644
 --- a/python/sglang/srt/entrypoints/http_server.py
 +++ b/python/sglang/srt/entrypoints/http_server.py
-@@ -129,6 +129,7 @@ from sglang.srt.managers.io_struct import (
+@@ -132,7 +132,9 @@ from sglang.srt.managers.io_struct import (
+     OpenSessionReqInput,
+     ParseFunctionCallReq,
      PauseGenerationReqInput,
-     PostProcessWeightsReqInput,
++    PostProcessWeightsReqInput,
      ProfileReq,
 +    PullWeightsReqInput,
      ReleaseMemoryOccupationReqInput,
      ResumeMemoryOccupationReqInput,
      SendWeightsToRemoteInstanceReqInput,
-@@ -1344,6 +1345,21 @@ async def post_process_weights(req: PostProcessWeightsReqInput, request: Request
-     )
+@@ -762,10 +764,8 @@ async def model_info():
+ @app.get("/weight_version")
+ async def weight_version():
+     """Get the current weight version."""
+-    raise HTTPException(
+-        status_code=404,
+-        detail="Endpoint '/get_weight_version' or '/weight_version' is deprecated. Please use '/model_info' instead.",
+-    )
++    result = await model_info()
++    return {"weight_version": result.get("weight_version", None)}
+ 
+ 
+ @app.get("/get_server_info")
+@@ -782,9 +782,18 @@ async def get_server_info():
+ async def server_info():
+     """Get the server information."""
+     # Returns internal states per DP.
+-    internal_states: List[Dict[Any, Any]] = (
+-        await _global_state.tokenizer_manager.get_internal_state()
+-    )
++    server_info_timeout = float(os.environ.get("SGLANG_SERVER_INFO_TIMEOUT", "2"))
++    try:
++        internal_states: List[Dict[Any, Any]] = await asyncio.wait_for(
++            _global_state.tokenizer_manager.get_internal_state(),
++            timeout=server_info_timeout,
++        )
++    except asyncio.TimeoutError:
++        logger.warning(
++            "Timed out getting internal state for /server_info after %.1fs; returning empty internal_states",
++            server_info_timeout,
++        )
++        internal_states = []
+ 
+     server_args = _global_state.tokenizer_manager.server_args
+ 
+@@ -1409,6 +1418,35 @@ async def update_weights_from_ipc(
+         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
  
  
 +@app.post("/pull_weights")
@@ -29,15 +66,46 @@ index c74f7666a9972ba7ee5b0c94c805189e640fbbda..107c6eadf6a33e19f4f34d3668c22856
 +    )
 +
 +
++@app.post("/post_process_weights")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def post_process_weights(req: PostProcessWeightsReqInput, request: Request):
++    """Optional post-processing for updated weights, e.g. quantization packing."""
++    success, message = await _global_state.tokenizer_manager.post_process_weights(
++        req, request
++    )
++
++    content = {"success": success, "message": message}
++    return ORJSONResponse(
++        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
++    )
++
++
  @app.post("/update_weight_version")
  @auth_level(AuthLevel.ADMIN_OPTIONAL)
  async def update_weight_version(
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
-index e13964675d0dc3bceffa0a7df63e11111c1e416d..9de60810205e1ded3c1a4975c86a887e8c942145 100644
+index 928348e..87d4eac 100644
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
-@@ -1739,6 +1739,22 @@ class CheckWeightsReqOutput(BaseReq, kw_only=True):
-     payload: Optional[Dict[str, Any]] = None
+@@ -1862,6 +1862,16 @@ class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
+     pass
+ 
+ 
++class PostProcessWeightsReqInput(BaseReq, kw_only=True):
++    restore_weights_before_load: bool = False
++    post_process_quantization: bool = False
++
++
++class PostProcessWeightsReqOutput(BaseReq, kw_only=True):
++    success: bool
++    message: str
++
++
+ class CheckWeightsReqInput(BaseReq, kw_only=True):
+     action: str = "checksum"
+     allow_quant_error: bool = False
+@@ -1895,6 +1905,22 @@ class CheckWeightsReqOutput(BaseReq, kw_only=True):
+     payload: Optional[List[ChecksumInfo]] = None
  
  
 +class PullWeightsReqInput(BaseReq, kw_only=True):
@@ -59,19 +127,42 @@ index e13964675d0dc3bceffa0a7df63e11111c1e416d..9de60810205e1ded3c1a4975c86a887e
  class SlowDownReqInput(BaseReq, kw_only=True):
      forward_sleep_time: Optional[float]
  
+@@ -2205,6 +2231,9 @@ class DumperControlReqInput(BaseReq, kw_only=True):
+ 
+ 
+ class DumperControlReqOutput(BaseReq, kw_only=True):
++    # Per-request breakdown of every queue, only populated when "inflight" or
++    # "all" is requested.
++    inflight: Optional[List[Dict[str, Any]]] = None
+     success: bool
+     # JSON-native per-worker response dicts.
+     response: List[Dict[str, Any]]
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index d4169bebe0b58fc4f32d04e307e5132e66f364ff..e62eae2d4b613219a6227ba7080d9e89feac6207 100644
+index a9615a1..947321d 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -128,6 +128,7 @@ from sglang.srt.managers.io_struct import (
+@@ -141,7 +141,9 @@ from sglang.srt.managers.io_struct import (
+     LoadLoRAAdapterReqOutput,
+     OpenSessionReqInput,
      PauseGenerationReqInput,
-     PostProcessWeightsReqInput,
++    PostProcessWeightsReqInput,
      ProfileReq,
 +    PullWeightsReqInput,
      ReleaseMemoryOccupationReqInput,
      RemoveExternalCorpusReqInput,
      RemoveExternalCorpusReqOutput,
-@@ -1437,6 +1438,10 @@ class Scheduler(
+@@ -1539,6 +1541,10 @@ class Scheduler(
+                     UpdateWeightsFromIPCReqInput,
+                     self.weight_updater.update_weights_from_ipc,
+                 ),
++                (
++                    PostProcessWeightsReqInput,
++                    self.weight_updater.post_process_weights,
++                ),
+                 (
+                     GetWeightsByNameReqInput,
+                     self.weight_updater.get_weights_by_name,
+@@ -1555,6 +1561,10 @@ class Scheduler(
                      CheckWeightsReqInput,
                      self.weight_updater.check_weights,
                  ),
@@ -82,20 +173,57 @@ index d4169bebe0b58fc4f32d04e307e5132e66f364ff..e62eae2d4b613219a6227ba7080d9e89
                  (SlowDownReqInput, self.slow_down),
                  (
                      ProfileReq,
+@@ -4457,6 +4467,12 @@ class Scheduler(
+                 # The request will still run one decode forward pass.
+                 # Then we reuse all existing code to clean up the KV cache allocation.
+                 logger.debug(f"Abort running request. {req.rid=}")
++                if self.disaggregation_mode == DisaggregationMode.PREFILL and hasattr(
++                    req, "disagg_kv_sender"
++                ):
++                    sender = getattr(req, "disagg_kv_sender", None)
++                    if sender is not None and hasattr(sender, "abort"):
++                        sender.abort()
+                 req.to_finish = FINISH_ABORT()
+ 
+     def _pause_engine(self) -> Tuple[List[Req], int]:
 diff --git a/python/sglang/srt/managers/scheduler_components/weight_updater.py b/python/sglang/srt/managers/scheduler_components/weight_updater.py
-index 505bd2994fbf4812c5069d4391cb80197d42f80c..2ed3b21d75c748a567478686d335184920dcf26b 100644
+index 653b28c..c7ba14a 100644
 --- a/python/sglang/srt/managers/scheduler_components/weight_updater.py
 +++ b/python/sglang/srt/managers/scheduler_components/weight_updater.py
-@@ -28,6 +28,8 @@ from sglang.srt.managers.io_struct import (
+@@ -26,8 +26,12 @@ from sglang.srt.managers.io_struct import (
+     DestroyWeightsUpdateGroupReqOutput,
+     GetWeightsByNameReqInput,
+     GetWeightsByNameReqOutput,
++    PostProcessWeightsReqInput,
++    PostProcessWeightsReqOutput,
+     InitWeightsUpdateGroupReqInput,
      InitWeightsUpdateGroupReqOutput,
-     PostProcessWeightsReqInput,
-     PostProcessWeightsReqOutput,
 +    PullWeightsReqInput,
 +    PullWeightsReqOutput,
      ReleaseMemoryOccupationReqInput,
      ReleaseMemoryOccupationReqOutput,
      ResumeMemoryOccupationReqInput,
-@@ -309,6 +311,40 @@ class SchedulerWeightUpdaterManager:
+@@ -199,6 +203,19 @@ class SchedulerWeightUpdaterManager:
+                 f"Restart with --weight-cache-mode off to use this operation."
+             )
+ 
++    def post_process_weights(self, recv_req: PostProcessWeightsReqInput):
++        success, message = self.tp_worker.post_process_weights(recv_req)
++        if (
++            success
++            and self.draft_worker is not None
++            and hasattr(self.draft_worker, "post_process_weights")
++        ):
++            success, message = self.draft_worker.post_process_weights(recv_req)
++        if not success:
++            logger.error(message)
++        torch.distributed.barrier(group=self.tp_cpu_group)
++        return PostProcessWeightsReqOutput(success=success, message=message)
++
+     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+         assert (
+             self.is_fully_idle()
+@@ -286,6 +303,40 @@ class SchedulerWeightUpdaterManager:
  
          return ResumeMemoryOccupationReqOutput()
  
@@ -137,10 +265,15 @@ index 505bd2994fbf4812c5069d4391cb80197d42f80c..2ed3b21d75c748a567478686d3351849
          try:
              payload = self.tp_worker.model_runner.check_weights(
 diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
-index b733d20234ea1d3cb8b9bae77259229bea76a059..22495de1cc4f74db5332363dd990cd2b7acab1de 100644
+index 7cfd98b..67de45b 100644
 --- a/python/sglang/srt/managers/tokenizer_control_mixin.py
 +++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
-@@ -53,6 +53,8 @@ from sglang.srt.managers.io_struct import (
+@@ -48,9 +48,13 @@ from sglang.srt.managers.io_struct import (
+     LoadLoRAAdapterReqOutput,
+     LoRAUpdateOutput,
+     OpenSessionReqInput,
++    PostProcessWeightsReqInput,
++    PostProcessWeightsReqOutput,
      ProfileReq,
      ProfileReqOutput,
      ProfileReqType,
@@ -149,17 +282,19 @@ index b733d20234ea1d3cb8b9bae77259229bea76a059..22495de1cc4f74db5332363dd990cd2b
      ReleaseMemoryOccupationReqInput,
      ReleaseMemoryOccupationReqOutput,
      RemoveExternalCorpusReqInput,
-@@ -102,6 +104,7 @@ _COMMUNICATOR_SPECS = [
+@@ -100,7 +104,9 @@ _COMMUNICATOR_SPECS = [
+     ),
+     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
      ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
-     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
-     ("post_process_weights", PostProcessWeightsReqOutput),
 +    ("pull_weights", PullWeightsReqOutput),
+     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
++    ("post_process_weights", PostProcessWeightsReqOutput),
      ("get_weights_by_name", GetWeightsByNameReqOutput),
      ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
      ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
-@@ -760,6 +763,15 @@ class TokenizerControlMixin:
-             results = await self.post_process_weights_communicator(obj)
-         return FanOutCommunicator.merge_results(results)
+@@ -797,6 +803,25 @@ class TokenizerControlMixin:
+         self.auto_create_handle_loop()
+         await self.resume_memory_occupation_communicator(obj)
  
 +    async def pull_weights(
 +        self: TokenizerManager,
@@ -170,27 +305,37 @@ index b733d20234ea1d3cb8b9bae77259229bea76a059..22495de1cc4f74db5332363dd990cd2b
 +        results = await self.pull_weights_communicator(obj)
 +        return FanOutCommunicator.merge_results(results)
 +
++    async def post_process_weights(
++        self: TokenizerManager,
++        obj: PostProcessWeightsReqInput,
++        request: Optional[fastapi.Request] = None,
++    ) -> Tuple[bool, str]:
++        self.auto_create_handle_loop()
++        async with self.model_update_lock.writer_lock:
++            results = await self.post_process_weights_communicator(obj)
++        return FanOutCommunicator.merge_results(results)
++
      async def check_weights(
          self: TokenizerManager,
          obj: CheckWeightsReqInput,
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index 5af52950ff182997cf51badc33e53dc45475a93b..bd708d202f110af01d4a2ff583a8f153869a84c5 100644
+index 1866495..b3c50e5 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
-@@ -2376,6 +2376,10 @@ class ServerArgs:
-             nargs="*",
+@@ -3092,6 +3092,10 @@ class ServerArgs:
          ),
+         NS("model"),
      ] = None
 +    custom_pull_weights_pre_read_hook: A[
 +        Optional[str],
 +        "Import path of a hook(source_dir, target_version) that /pull_weights calls before reading published weights.",
 +    ] = None
      weight_loader_disable_mmap: A[
-         bool,
-         "Disable mmap while loading weight using safetensors.",
+         bool, "Disable mmap while loading weight using safetensors.", NS("model")
+     ] = False
 diff --git a/python/sglang/srt/weight_sync/local_checkpoint.py b/python/sglang/srt/weight_sync/local_checkpoint.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..2fc0593931940342eebf849751ec518a26585f85
+index 0000000..2fc0593
 --- /dev/null
 +++ b/python/sglang/srt/weight_sync/local_checkpoint.py
 @@ -0,0 +1,349 @@

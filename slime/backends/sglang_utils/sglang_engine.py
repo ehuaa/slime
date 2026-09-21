@@ -48,7 +48,15 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     from sglang.srt.entrypoints.http_server import launch_server
 
     multiprocessing.set_start_method("spawn", force=True)
-    server_args.host = server_args.host.strip("[]")
+    # SGLang >= 0.5.17 freezes ServerArgs once resolved; bare assignment raises and
+    # post-resolution edits must go through override(). Older versions have no such
+    # method, so fall back to assigning directly.
+    host = server_args.host.strip("[]")
+    if host != server_args.host:
+        if hasattr(server_args, "override"):
+            server_args.override("slime.launch_server_process", host=host)
+        else:
+            server_args.host = host
     p = multiprocessing.Process(target=launch_server, args=(server_args,))
     p.start()
 

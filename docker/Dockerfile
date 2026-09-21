@@ -1,5 +1,11 @@
-ARG SGLANG_IMAGE_TAG=v0.5.15.post1-cu129
-FROM slimerl/sglang:${SGLANG_IMAGE_TAG} AS sglang
+# slimerl/sglang is a re-tag of lmsysorg/sglang (identical 63 layers, no extra layers
+# of its own), so pull upstream directly rather than waiting on a re-publish.
+# v0.5.17 is the newest tag that still pins torch==2.11.0. v0.5.18+ moves to
+# torch==2.13.0, which breaks the prebuilt TransformerEngine/Megatron/apex
+# extensions in this image, and it carries no GDN changes we need: its only
+# ReplaySSM-adjacent additions are a KDA Helion kernel and an Ascend NPU backend.
+ARG SGLANG_IMAGE_TAG=v0.5.17-cu129
+FROM lmsysorg/sglang:${SGLANG_IMAGE_TAG} AS sglang
 
 # ======================================== Arguments =============================================
 
@@ -133,11 +139,13 @@ RUN cd Megatron-LM && \
     rm -f megatron*.patch
 
 # TODO temporarily skip patching for GB200/GB300 (and require users to bring their own sglang version). should add back later.
+# Only sglang.patch and sglang-pull_weights.patch are realigned onto v0.5.17; the other
+# three stay parked under docker/patch/v0.5.15.post1/ and the -f guard skips them.
 ARG ENABLE_SGLANG_PATCH=1
 COPY docker/patch/${PATCH_VERSION}/sglang*.patch /sgl-workspace/sglang/
 RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
   cd /sgl-workspace/sglang && \
-  for patch in sglang.patch sglang-top_p.patch sglang-release_hicache.patch sglang-pull_weights.patch sglang-deterministic.patch; do \
+  for patch in sglang.patch sglang-pull_weights.patch sglang-top_p.patch sglang-release_hicache.patch sglang-deterministic.patch; do \
     if [ ! -f "$patch" ]; then \
       continue; \
     fi; \
