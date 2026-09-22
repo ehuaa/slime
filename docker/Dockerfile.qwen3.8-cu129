@@ -1,0 +1,122 @@
+# Qwen3.8-27B RL image: slime v0.3.2-cu129 + sglang v0.5.17 (ReplaySSM).
+#
+# Why this exists: v0.3.2-cu130 builds TransformerEngine from source with
+# NVTE_CUDA_ARCHS=100a;103a and emits no PTX, so every TE kernel fails on A100
+# with "no kernel image is available".  The -cu129 tag takes the other branch of
+# that Dockerfile and installs the official PyPI wheel instead, which carries
+# sm_70/75/80/89/90/90a/100/100a/103a -- hence A100 works there and only there.
+# Do NOT rebase this onto a cu130 tag without fixing NVTE_CUDA_ARCHS first.
+#
+# Build from the repo root so the patches are in context:
+#   docker build -f docker/Dockerfile.qwen3.8-cu129 -t <your-registry>/slime:qwen3.8-cu129 .
+#
+# The two +cu129 wheels are ~430MB total and come from GitHub.  If that link is
+# slow, pre-download them next to this repo and swap the RUN for the COPY form
+# noted inline below.
+
+ARG BASE_IMAGE=slimerl/slime:v0.3.2-cu129
+FROM ${BASE_IMAGE}
+
+ARG SGLANG_VERSION=v0.5.17
+ARG SGL_KERNEL_VERSION=0.4.5
+ARG SGL_DEEP_GEMM_VERSION=0.1.5.post1
+ENV SGLANG_SRC=/sgl-workspace/sglang-${SGLANG_VERSION}
+
+# ---------------------------------------------------------------------------
+# 1. sglang v0.5.17 source.  Sparse: every file the slime patches touch lives
+#    under python/, so python/sglang plus the cone-mode parents is 74MB instead
+#    of the full tree.  Note this leaves no rust/ directory, which step 4 needs
+#    to work around.
+# ---------------------------------------------------------------------------
+RUN cd /sgl-workspace && \
+    git clone --filter=blob:none --sparse --depth 1 --branch ${SGLANG_VERSION} \
+        https://github.com/sgl-project/sglang.git sglang-${SGLANG_VERSION} && \
+    cd sglang-${SGLANG_VERSION} && \
+    git sparse-checkout set python/sglang
+
+# ---------------------------------------------------------------------------
+# 2. slime's sglang patches, realigned onto v0.5.17 (27 files).  These carry the
+#    /pull_weights endpoint and the weight-update hooks slime drives, so the
+#    engine will not come up without them.
+# ---------------------------------------------------------------------------
+COPY docker/patch/latest/sglang.patch docker/patch/latest/sglang-pull_weights.patch /tmp/
+RUN cd ${SGLANG_SRC} && \
+    git apply /tmp/sglang.patch && \
+    git apply /tmp/sglang-pull_weights.patch && \
+    rm -f /tmp/sglang.patch /tmp/sglang-pull_weights.patch && \
+    [ "$(git status --porcelain | wc -l)" -eq 27 ]
+
+# ---------------------------------------------------------------------------
+# 3. CUDA 12 dependency fixups -- the same three the upstream sglang Dockerfile
+#    applies on its cu12 branch.  v0.5.17 pins the cu13 extras by default, which
+#    would drag CUDA 13 runtime wheels into a cu129 image.
+# ---------------------------------------------------------------------------
+RUN cd ${SGLANG_SRC} && \
+    sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/'            python/pyproject.toml && \
+    sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' python/pyproject.toml && \
+    sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/'     python/pyproject.toml && \
+    ! grep -q 'cu13' python/pyproject.toml
+
+# ---------------------------------------------------------------------------
+# 4. Editable install.  torch stays at 2.11.0+cu129: v0.5.17 pins torch==2.11.0
+#    without a CUDA variant, so pip leaves the base image's build alone.
+#
+#    SGLANG_BUILD_RUST_EXTS=none is required here.  setup.py imports build_rust
+#    from setuptools-rust, and pip's build isolation installs it per
+#    [build-system] requires, which then sends setup.py looking for
+#    ../rust/Cargo.toml -- absent under the sparse checkout.  The env var takes
+#    the same short-circuit sdists use.  The two extensions it skips
+#    (sglang.srt.grpc._core, sglang.srt.multimodal._core) are only reachable via
+#    --grpc-port and the Inkling multimodal path, neither of which slime uses,
+#    and the base image ships neither either.
+# ---------------------------------------------------------------------------
+RUN cd ${SGLANG_SRC} && \
+    SGLANG_BUILD_RUST_EXTS=none pip install -e python/ --no-cache-dir --timeout 60 --retries 10
+
+# ---------------------------------------------------------------------------
+# 5. Prebuilt binaries that only exist as cu13 builds on PyPI.  Step 4 pulls
+#    sglang-kernel==0.4.5 and sgl-deep-gemm==0.1.5.post1 from PyPI, whose .so
+#    files link libnvrtc.so.13 / libcudart.so.13 and fail to load here with
+#    "No module named 'common_ops'".  The +cu129 wheels are published on GitHub
+#    only.  --no-deps keeps pip from re-resolving torch off default PyPI.
+#
+#    Offline alternative: drop the wheels in the build context and use
+#      COPY sglang_kernel-*.whl sgl_deep_gemm-*.whl /tmp/wheels/
+#      RUN pip install --force-reinstall --no-deps /tmp/wheels/*.whl && rm -rf /tmp/wheels
+# ---------------------------------------------------------------------------
+RUN ARCH="$(uname -m)" && \
+    pip install --force-reinstall --no-deps --no-cache-dir \
+      "https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu129-cp310-abi3-manylinux2014_${ARCH}.whl" && \
+    pip install --force-reinstall --no-deps --no-cache-dir \
+      "https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_${ARCH}.whl"
+
+# ---------------------------------------------------------------------------
+# 6. Repair _batched_p2p_ops.  slime's megatron.patch drops the `group` argument
+#    from the isend/irecv ops, which deadlocks any run with PP>1 and CP>1.  The
+#    launch script re-applies this on every node at startup; doing it here makes
+#    that a no-op.
+# ---------------------------------------------------------------------------
+ARG MEGATRON_PATH=/root/Megatron-LM
+RUN P2P="${MEGATRON_PATH}/megatron/core/pipeline_parallel/p2p_communication.py" && \
+    sed -i -E 's/^( +torch\.distributed\.(isend|irecv), tensor_(send|recv)_(prev|next), (prev|next)_pipeline_rank),$/\1, group,/' "$P2P" && \
+    [ "$(grep -c 'pipeline_rank, group,$' "$P2P")" -eq 4 ]
+
+# ---------------------------------------------------------------------------
+# 7. flashinfer version check.  v0.5.17 needs flashinfer-python >= 0.6.15.post1,
+#    which step 4 installs, but flashinfer-cubin/-jit-cache stay at the base
+#    image's 0.6.12 -- matching builds are published on flashinfer.ai's own index
+#    (611MB for cubin alone), not PyPI.  The check that trips is a plain string
+#    comparison in flashinfer/jit/env.py that only picks the cubin directory;
+#    cubins themselves are addressed by filename + SHA-256 and re-downloaded when
+#    missing, so skipping it changes no behaviour.  To align properly instead:
+#      pip install flashinfer-cubin==0.6.15.post1     --index-url https://flashinfer.ai/whl
+#      pip install flashinfer-jit-cache==0.6.15.post1 --index-url https://flashinfer.ai/whl/cu129
+# ---------------------------------------------------------------------------
+ENV FLASHINFER_DISABLE_VERSION_CHECK=1
+
+# ---------------------------------------------------------------------------
+# 8. Fail the build rather than a 90-minute rollout.  Kept as a COPYed script
+#    rather than a heredoc so the file builds on pre-BuildKit docker too.
+# ---------------------------------------------------------------------------
+COPY docker/qwen3.8/verify-image.py /tmp/verify-image.py
+RUN python3 /tmp/verify-image.py && rm -f /tmp/verify-image.py
