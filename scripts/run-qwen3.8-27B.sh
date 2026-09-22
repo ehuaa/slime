@@ -114,9 +114,17 @@ sync && { echo 3 > /proc/sys/vm/drop_caches; } 2>/dev/null || true
 { echo 1 > /proc/sys/vm/compact_memory; } 2>/dev/null || true
 echo "node $(hostname): uptime=$(awk '{printf "%d", $1/86400}' /proc/uptime)d order9/10=$(awk '/Normal/{print $(NF-1)"/"$NF}' /proc/buddyinfo | paste -sd' ' -)"
 cat > /root/free_watchdog.sh <<'WDEOF'
+order10() { awk '/Normal/{s+=$NF} END{print s+0}' /proc/buddyinfo; }
 while true; do
   f=$(awk '/MemFree/{print int($2/1048576)}' /proc/meminfo)
-  if [ "$f" -lt 250 ]; then sync; echo 3 > /proc/sys/vm/drop_caches; echo "$(date +%F_%T) dropped caches (free was ${f}GB)"; fi
+  # pause() wants physically contiguous pages, and dropping caches does not defragment,
+  # so watch the order-10 blocks as well: they can run out while MemFree still reads ~900GB.
+  o=$(order10)
+  if [ "$f" -lt 250 ] || [ "$o" -lt 20000 ]; then
+    sync; echo 3 > /proc/sys/vm/drop_caches
+    echo 1 > /proc/sys/vm/compact_memory
+    echo "$(date +%F_%T) drop+compact (free=${f}GB order10=${o} -> $(order10))"
+  fi
   sleep 120
 done
 WDEOF
