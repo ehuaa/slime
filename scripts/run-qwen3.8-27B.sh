@@ -26,10 +26,30 @@ DAPO_DATA=${DAPO_DATA:-/mnt/data/data/home/zhh/data/data4RL/math/processed/dapo_
 AIME_DATA=${AIME_DATA:-/mnt/data/data/datasets/geo-rl/eval/aime-2024.jsonl}
 
 # ---------------------------------------------------------------- cluster
-# k8s names in /etc/mpi/hostfile do not resolve; MASTER_ADDR/HOSTFILE carry bond0 IPs.
-# (Temporarily restoring /tmp/resolv.conf.bak makes them resolvable long enough to look up.)
+# Launch this EXACT script on every node with MASTER_ADDR set; each one works out its
+# own role.  Schedulers that run the entrypoint on all pods (k8s Jobs) would otherwise
+# have every pod reach `ray start --head`, and all but the first die with
+# "Session name ... does not match persisted value".
 MASTER_ADDR=${MASTER_ADDR:-}
-if [ -z "${MASTER_ADDR}" ]; then echo "MASTER_ADDR is not set (bond0 10.200.x IP)."; exit 1; fi
+if [ -z "${MASTER_ADDR}" ]; then echo "MASTER_ADDR is not set (hostname or bond0 IP)."; exit 1; fi
+
+# Resolve to an IP.  Ray takes it as --node-ip-address and the sglang engines register
+# with the router under it; a mix of hostname and IP worker URLs breaks the router pool.
+MASTER_HOST=${MASTER_ADDR%%,*}      # first entry if the scheduler passes a list
+if echo "${MASTER_HOST}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+   MASTER_ADDR=${MASTER_HOST}
+else
+   MASTER_ADDR=$(getent hosts "${MASTER_HOST}" | awk '{print $1; exit}')
+fi
+[ -n "${MASTER_ADDR}" ] || { echo "FATAL: cannot resolve master IP from ${MASTER_HOST}"; exit 1; }
+
+# Master iff one of this node's own IPs is MASTER_ADDR.  Must be `hostname -I` (ALL
+# addresses): these nodes have several NICs and `hostname -i` returns just one, not
+# necessarily the one on the master network.
+if hostname -I | tr ' ' '\n' | grep -qx "${MASTER_ADDR}"; then ROLE=master; else ROLE=worker; fi
+echo "ROLE=${ROLE}  MASTER_ADDR=${MASTER_ADDR}  ($(hostname))"
+
+# Only used by the legacy ssh fan-out, which the per-node role split replaces.
 HOSTFILE=${HOSTFILE:-${SLIME_DIR}/hostfile.ip}
 SSH_PORT=${SSH_PORT:-8081}          # 22 is the host sshd and rejects our key
 
@@ -116,13 +136,33 @@ fi
 echo "_batched_p2p_ops passes group OK on $(hostname)"
 PREP
 
+# Every node preps itself -- no scp/ssh fan-out, so this works on clusters where the
+# nodes cannot ssh to each other.
 bash /tmp/slime_node_prep.sh
-if [ -f "${HOSTFILE}" ]; then
-  for WORKER_IP in $(awk 'NF{print $1}' "${HOSTFILE}"); do
-    [[ "${WORKER_IP}" == "${MASTER_ADDR}" ]] && continue
-    scp -P "${SSH_PORT}" -o StrictHostKeyChecking=no /tmp/slime_node_prep.sh root@"${WORKER_IP}":/tmp/slime_node_prep.sh
-    ssh -n -p "${SSH_PORT}" -o StrictHostKeyChecking=no root@"${WORKER_IP}" "bash /tmp/slime_node_prep.sh"
-  done
+
+# ---------------------------------------------------------------- worker
+# Join the head's cluster and idle until it goes away.  Everything below this block is
+# master-only.
+if [ "${ROLE}" = "worker" ]; then
+   export no_proxy="127.0.0.1,localhost,${MASTER_ADDR},${MASTER_HOST}"
+   until (exec 3<>"/dev/tcp/${MASTER_ADDR}/6379") 2>/dev/null; do
+      echo "waiting for ray head at ${MASTER_ADDR}:6379 ..."; sleep 5
+   done
+   # Pick the IP on MASTER_ADDR's network, NOT the first of `hostname -I`: these nodes
+   # carry ~9 addresses (bond0 / bondMG / bondYW / cni0 / ...) and the first one is on
+   # the wrong network, which would register this worker with ray -- and its sglang
+   # engines with the router -- under an address the other nodes cannot reach.
+   # Matching by prefix rather than reading SOCKET_IFNAME because this image ships no
+   # `ip` command (only ifconfig), so `ip addr show bond0` silently yields nothing.
+   WIP=$(hostname -I | tr ' ' '\n' | grep -E "^$(echo "${MASTER_ADDR}" | cut -d. -f1-2)\." | head -1)
+   [ -n "${WIP}" ] || { echo "FATAL: no local IP on ${MASTER_ADDR}'s network; have: $(hostname -I)"; exit 1; }
+   echo "joining ray from ${WIP}"
+   ray start --address="${MASTER_ADDR}:6379" --num-gpus "${ACTOR_NUM_GPUS_PER_NODE}" \
+      --node-ip-address "${WIP}" --disable-usage-stats
+   sleep 30
+   while (exec 3<>"/dev/tcp/${MASTER_ADDR}/6379") 2>/dev/null; do sleep 30; done
+   echo "ray head gone, worker exiting"
+   exit 0
 fi
 
 # ---------------------------------------------------------------- args
@@ -298,15 +338,17 @@ MISC_ARGS=(
 export no_proxy="127.0.0.1,localhost,${MASTER_ADDR}"
 ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${ACTOR_NUM_GPUS_PER_NODE}" --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
-if [ -f "${HOSTFILE}" ]; then
-  for WORKER_IP in $(awk 'NF{print $1}' "${HOSTFILE}"); do
-    [[ "${WORKER_IP}" == "${MASTER_ADDR}" ]] && continue
-    echo "Starting Ray worker on ${WORKER_IP}"
-    ssh -n -p "${SSH_PORT}" -o StrictHostKeyChecking=no root@"${WORKER_IP}" \
-      "pkill -9 sglang ; ray stop --force ; pkill -9 python ; cd ${SLIME_DIR} && ray start --address=${MASTER_ADDR}:6379 --num-gpus ${ACTOR_NUM_GPUS_PER_NODE} --node-ip-address ${WORKER_IP} --disable-usage-stats" &
-  done
-  wait
-fi
+# Workers join on their own (see the worker block above); wait for all of them to
+# register before submitting, or the job starts on a short cluster.
+WANT_GPUS=$((ACTOR_NUM_NODES * ACTOR_NUM_GPUS_PER_NODE))
+for _ in $(seq 1 120); do
+   HAVE=$(python3 -c "import ray;ray.init(address='auto',log_to_driver=False);print(int(ray.cluster_resources().get('GPU',0)))" 2>/dev/null || echo 0)
+   [ "${HAVE:-0}" -ge "${WANT_GPUS}" ] && break
+   echo "waiting for workers: ${HAVE:-0}/${WANT_GPUS} GPUs registered"; sleep 10
+done
+[ "${HAVE:-0}" -ge "${WANT_GPUS}" ] \
+   || { echo "FATAL: only ${HAVE:-0}/${WANT_GPUS} GPUs after 20 min"; exit 1; }
+echo "cluster ready: ${HAVE}/${WANT_GPUS} GPUs"
 
 RUNTIME_ENV_JSON=$(cat <<EOF_JSON
 {
