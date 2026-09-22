@@ -7,6 +7,21 @@ import wandb
 logger = logging.getLogger(__name__)
 
 
+def _generate_run_id() -> str:
+    """Short random suffix for the run group.
+
+    wandb 0.29 moved generate_id out of wandb.util into wandb.sdk.lib.runid;
+    calling the old path raises AttributeError and takes down the whole job at
+    init_tracking, before a single step runs.
+    """
+    try:
+        return wandb.util.generate_id()
+    except AttributeError:
+        from wandb.sdk.lib.runid import generate_id
+
+        return generate_id()
+
+
 def _is_offline_mode(args) -> bool:
     """Detect whether W&B should run in offline mode.
 
@@ -43,7 +58,7 @@ def init_wandb_primary(args):
     # Prepare wandb init parameters
     # add random 6 length string with characters
     if args.wandb_random_suffix:
-        group = args.wandb_group + "_" + wandb.util.generate_id()
+        group = args.wandb_group + "_" + _generate_run_id()
         run_name = f"{group}-RANK_{args.rank}"
     else:
         group = args.wandb_group
