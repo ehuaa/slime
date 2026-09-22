@@ -235,13 +235,41 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=()
 
 SGLANG_ARGS=( --rollout-num-gpus-per-engine 2 --sglang-mem-fraction-static "${ROLLOUT_MEM_UTILIZATION}" )
-# NO_SPEC=1 disables EAGLE/MTP speculative decoding. Note it also frees a lot of memory:
-# mamba_state_intermediate_size = mamba_cache_per_req * max_running_requests *
-# speculative_num_draft_tokens, i.e. 0.29GB per unit of concurrency (18.28GB at mrr=64),
-# which is what makes mrr=64 OOM during cuda graph capture with EAGLE on.
+# Speculative decoding on this model only pays off together with the ReplaySSM spec-verify
+# below.  Measured on 4x8 A100-80G, dapo-math-17k, two full steps each (NUM_ROLLOUT=2):
+#
+#                        rollout 0/1    rollout sum   end-to-end   KV tokens   retracts
+#   EAGLE alone           94.4 / 67.0      161.4        285.2       184,838      1147
+#   EAGLE + ReplaySSM     43.8 / 32.0       75.8        189.5       792,384       117
+#   NO_SPEC=1             47.8 / 64.2      112.0        218.4       887,930        98
+#
+# train_rollout_logprob_abs_diff stayed at 0.0119-0.0122 and reward at 0.914-0.922 across
+# all three, so the switches trade no accuracy.  EAGLE alone is the worst of the three: its
+# per-draft state snapshots (mamba_cache_per_req * max_running_requests *
+# speculative_num_draft_tokens = 0.29GB per unit of concurrency, 18.28GB at mrr=64) starve
+# the KV pool down to 184k tokens, and the resulting ~1.1k retracts cost more than
+# speculation ever wins back -- the same allocation is what OOMs cuda graph capture at
+# mrr=64.  Drop the snapshots and speculation turns positive again, which is why ReplaySSM
+# beats NO_SPEC despite handing back 95k tokens of KV pool to the ring buffer and the draft
+# model.  Caveat: the ReplaySSM-vs-NO_SPEC margin was 9% on rollout 0 but 2x on rollout 1;
+# generation length and reward rule out a data difference and the per-round retracts (26 vs
+# 76) explain part of it, but treat the ordering as solid and the ratio as noisy.
+#
+# NO_SPEC=1 disables EAGLE/MTP speculative decoding entirely.
 if [ -z "${NO_SPEC:-}" ]; then
    SGLANG_ARGS+=( --sglang-speculative-algorithm EAGLE --sglang-speculative-num-steps 3
                   --sglang-speculative-eagle-topk 1 --sglang-speculative-num-draft-tokens 4 )
+   # ReplaySSM spec-verify (RFC #28511 part B), on by default -- NO_REPLAYSSM=1 opts out.
+   # The verify keeps a per-slot window of raw inputs and the commit replays the accepted
+   # prefix into the fp32 checkpoint, instead of snapshotting the full recurrent state per
+   # draft step, so intermediate_ssm_state_cache is never allocated at all.  Needs a linear
+   # draft chain (eagle-topk 1, which is what we pass above) and is mutually exclusive with
+   # --sglang-enable-linear-replayssm (the decode-side part A) -- they share the ring storage
+   # but drive its cursor differently.  Bit-identical to the recurrent baseline at
+   # mamba_ssm_dtype=float32, which the switch sets for us.  Requires sglang >= 0.5.16.
+   if [ -z "${NO_REPLAYSSM:-}" ]; then
+      SGLANG_ARGS+=( --sglang-enable-linear-replayssm-spec )
+   fi
 fi
 SGLANG_ARGS+=(
    # Radix cache buys ~64-256 cached tokens against 10k+ token generations here, but forces
