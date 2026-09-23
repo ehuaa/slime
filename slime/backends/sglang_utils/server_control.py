@@ -110,8 +110,12 @@ async def _abort_server_once(url: str, request_timeout: float) -> None:
 
 
 async def _get_server_load(url: str, request_timeout: float) -> Any:
+    # These three sections carry every request counter the idle check reads.
+    # "inflight" is deliberately absent: it is not an upstream section, only a
+    # slime patch on sglang <= v0.5.15, and asking for it on any other build
+    # fails the whole query, which strands this drain loop until it times out.
     return await asyncio.wait_for(
-        get(f"{url}/v1/loads?include=core,disagg,queues,inflight", timeout=request_timeout),
+        get(f"{url}/v1/loads?include=core,disagg,queues", timeout=request_timeout),
         timeout=request_timeout,
     )
 
