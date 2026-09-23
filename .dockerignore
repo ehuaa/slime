@@ -1,0 +1,14 @@
+# Build context is the repo root, and the image now carries the tree itself
+# (Dockerfile.qwen3.8-cu129 step 9).  .git alone is 352MB against 16MB of
+# working tree and nothing at run time reads it, so it stays out; delete the
+# ".git" entry below if you want the image to carry its own history instead.
+.git
+.github
+
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/

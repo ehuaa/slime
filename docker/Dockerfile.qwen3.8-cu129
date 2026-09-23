@@ -7,7 +7,7 @@
 # sm_70/75/80/89/90/90a/100/100a/103a -- hence A100 works there and only there.
 # Do NOT rebase this onto a cu130 tag without fixing NVTE_CUDA_ARCHS first.
 #
-# Build from the repo root so the patches are in context:
+# Build from the repo root: the patches and slime itself both come from context.
 #   docker build -f docker/Dockerfile.qwen3.8-cu129 -t <your-registry>/slime:qwen3.8-cu129 .
 #
 # The two +cu129 wheels are ~430MB total and come from GitHub.  If that link is
@@ -130,3 +130,25 @@ ENV FLASHINFER_DISABLE_VERSION_CHECK=1
 # ---------------------------------------------------------------------------
 COPY docker/qwen3.8/verify-image.py /tmp/verify-image.py
 RUN python3 /tmp/verify-image.py && rm -f /tmp/verify-image.py
+
+# ---------------------------------------------------------------------------
+# 9. slime itself.  The base image ships a stock upstream /root/slime plus an
+#    editable install pointing at that path, so an image built without this step
+#    runs upstream code whatever branch it was built from -- and on a fresh
+#    cluster there is no per-node checkout to catch it.
+#
+#    rm first: COPY merges into an existing directory, which would keep the four
+#    files this branch deletes (train_async.py among them) and, since
+#    .dockerignore drops .git from the context, the base image's .git describing
+#    upstream history -- one `git checkout .` in the container would then revert
+#    the tree to upstream main.
+#
+#    Last step on purpose: every layer above is expensive and cache-stable, so a
+#    slime edit rebuilds only this 16MB one.  WORKDIR keeps cwd off /root, where
+#    `import slime` matches the repo root as a namespace package and
+#    slime.__file__ comes back None.
+# ---------------------------------------------------------------------------
+RUN rm -rf /root/slime
+COPY . /root/slime
+RUN cd /root/slime && pip install --no-deps --no-build-isolation -e .
+WORKDIR /root/slime
